@@ -25,7 +25,9 @@ import time
 import typing
 import numpy
 from Log import log
+from PTDevice import Device, TheanoFlags, getDevicesInitArgs
 from Config import Config
+from PTEngine import Engine
 from Dataset import Dataset, init_dataset, init_dataset_via_str
 from HDFDataset import HDFDataset
 from Debug import init_ipython_kernel, init_better_exchook, init_faulthandler, init_cuda_not_in_main_proc_check
