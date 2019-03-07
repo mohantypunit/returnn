@@ -102,7 +102,8 @@ class BackendEngine:
 
   Theano = 0
   TensorFlow = 1
-  selectedEngine = None  # type: typing.Optional[int]  # One of the possible engines.
+  PyTorch = 2
+  selectedEngine = None
 
   @classmethod
   def select_engine(cls, engine=None, config=None):
@@ -120,6 +121,8 @@ class BackendEngine:
         engine = cls.Theano
       if config.bool("use_tensorflow", False):
         engine = cls.TensorFlow
+      if config.bool("use_pytorch", False):
+        engine = cls.PyTorch
     cls.selectedEngine = engine
 
   @classmethod
@@ -172,6 +175,9 @@ class BackendEngine:
     """
     return cls.get_selected_engine() == cls.TensorFlow
 
+  @classmethod
+  def is_pytorch_selected(cls):
+    return cls.get_selected_engine() == cls.PyTorch
 
 def get_model_filename_postfix():
   """
@@ -367,6 +373,9 @@ def describe_tensorflow_version():
     git_info = "<unknown(git exception: %r)>" % e
   return "%s (%s in %s)" % (version, git_info, tdir)
 
+def describe_pytorch_version():
+  import torch
+  return "version %s" % (torch.__version__)
 
 def get_tensorflow_version_tuple():
   """

@@ -741,9 +741,9 @@ def _init_base(configfile=None, target_mode=None, epoch=None, sprint_opts=None):
 
   global engine
   if not engine:
-    devices = rnn.init_theano_devices()
-    rnn.print_task_properties(devices)
-    rnn.init_engine(devices)
+    devices = rnn.initDevices()
+    rnn.printTaskProperties(devices)
+    rnn.initEngine(devices)
     engine = rnn.engine
     assert isinstance(engine, Engine)
 

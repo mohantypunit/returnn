@@ -25,14 +25,15 @@ import time
 import typing
 import numpy
 from Log import log
-from PTDevice import Device, TheanoFlags, getDevicesInitArgs
+#from PTDevice import Device, TheanoFlags, getDevicesInitArgs
 from Config import Config
-from PTEngine import Engine
 from Dataset import Dataset, init_dataset, init_dataset_via_str
 from HDFDataset import HDFDataset
-from Debug import init_ipython_kernel, init_better_exchook, init_faulthandler, init_cuda_not_in_main_proc_check
-from Util import init_thread_join_hack, describe_returnn_version, describe_theano_version, \
-  describe_tensorflow_version, BackendEngine, get_tensorflow_version_tuple
+from Debug import initIPythonKernel, initBetterExchook, initFaulthandler, initCudaNotInMainProcCheck
+from Util import initThreadJoinHack, BackendEngine, describe_crnn_version, \
+  describe_theano_version, \
+  describe_tensorflow_version, get_tensorflow_version_tuple, \
+  describe_pytorch_version
 
 
 config = None  # type: typing.Optional[Config]
@@ -133,35 +134,45 @@ def init_config_json_network():
     config.network_topology_json = open(json_file).read()
 
 
-def init_theano_devices():
+def initDevices():
   """
-  Only for Theano.
-
-  :rtype: list[Device.Device]|None
+  :rtype: list[Device]
   """
-  if not BackendEngine.is_theano_selected():
-    return None
-  from Util import TheanoFlags
-  from Config import get_devices_init_args
-  from Device import Device
-  old_device_config = ",".join(config.list('device', ['default']))
-  if config.value("task", "train") == "nop":
-    return []
-  if "device" in TheanoFlags:
-    # This is important because Theano likely already has initialized that device.
-    config.set("device", TheanoFlags["device"])
-    print("Devices: Use %s via THEANO_FLAGS instead of %s." % (TheanoFlags["device"], old_device_config), file=log.v4)
-  dev_args = get_devices_init_args(config)
-  assert len(dev_args) > 0
-  devices = [Device(**kwargs) for kwargs in dev_args]
-  for device in devices:
-    while not device.initialized:
-      time.sleep(0.25)
-  if devices[0].blocking:
-    print("Devices: Used in blocking / single proc mode.", file=log.v4)
+  if BackendEngine.is_theano_selected():
+    from Device import Device, TheanoFlags, getDevicesInitArgs
+    oldDeviceConfig = ",".join(config.list('device', ['default']))
+    if config.value("task", "train") == "nop":
+      return []
+    if "device" in TheanoFlags:
+      # This is important because Theano likely already has initialized that device.
+      config.set("device", TheanoFlags["device"])
+      print("Devices: Use %s via THEANO_FLAGS instead of %s." % \
+                       (TheanoFlags["device"], oldDeviceConfig), file=log.v4)
+    devArgs = getDevicesInitArgs(config)
+    assert len(devArgs) > 0
+    devices = [Device(**kwargs) for kwargs in devArgs]
+    for device in devices:
+      while not device.initialized:
+        time.sleep(0.25)
+    if devices[0].blocking:
+      print("Devices: Used in blocking / single proc mode.", file=log.v4)
+    else:
+      print("Devices: Used in multiprocessing mode.", file=log.v4)
+    return devices
+  elif BackendEngine.is_pytorch_selected():
+    from PTDevice import Device, getDevicesInitArgs
+    if config.value("task", "train") == "nop":
+      return []
+    devArgs = getDevicesInitArgs(config)
+    assert len(devArgs) > 0
+    devices = [Device(**kwargs) for kwargs in devArgs]
+    for device in devices:
+      while not device.initialized:
+        time.sleep(0.25)
+    print("Devices:", devArgs, file=log.v4)
+    return devices
   else:
-    print("Devices: Used in multiprocessing mode.", file=log.v4)
-  return devices
+    return None
 
 
 def get_cache_byte_sizes():
@@ -287,10 +298,13 @@ def init_engine(devices):
   global engine
   if BackendEngine.is_theano_selected():
     import Engine
-    engine = Engine.Engine(devices)
+    engine = Engine(devices)
   elif BackendEngine.is_tensorflow_selected():
     import TFEngine
     engine = TFEngine.Engine(config=config)
+  elif BackendEngine.is_pytorch_selected():
+    import PTEngine
+    engine = PTEngine.Engine(devices)
   else:
     raise NotImplementedError
 
@@ -364,7 +378,9 @@ def init_backend_engine():
     setup_tf_thread_pools(log_file=log.v3, tf_session_opts=tf_session_opts)
     # Print available devices. Also make sure that get_tf_list_local_devices uses the correct TF session opts.
     print_available_devices(tf_session_opts=tf_session_opts, file=log.v2)
-    debug_register_better_repr()
+    debugRegisterBetterRepr()
+  elif BackendEngine.is_pytorch_selected():
+    print("PyTorch:", describe_pytorch_version(), file=log.v3)
   else:
     raise NotImplementedError
 
@@ -392,14 +408,14 @@ def init(config_filename=None, command_line_options=(), config_updates=None, ext
     if config.value('task', 'train') == "theano_graph":
       config.set("multiprocessing", False)
     if config.bool('multiprocessing', True):
-      init_cuda_not_in_main_proc_check()
+      initCudaNotInMainProcCheck()
+  devices = initDevices()
   if config.bool('ipython', False):
-    init_ipython_kernel()
-  init_config_json_network()
-  devices = init_theano_devices()
-  if need_data():
-    init_data()
-  print_task_properties(devices)
+    initIPythonKernel()
+  initConfigJsonNetwork()
+  if needData():
+    initData()
+  printTaskProperties(devices)
   if config.value('task', 'train') == 'server':
     import Server
     global server
