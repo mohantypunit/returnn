@@ -432,7 +432,7 @@ def finalize():
   global quit_returnn
   quit_returnn = True
   sys.exited = True
-  if BackendEngine.is_theano_selected():
+  if BackendEngine.is_theano_selected() or BackendEngine.is_pytorch_selected():
     if engine:
       for device in engine.devices:
         device.terminate()
