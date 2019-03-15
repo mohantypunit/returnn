@@ -92,6 +92,5 @@ class SingleLayerLstm(nn.Module):
       i = torch.ones((T, B), requires_grad=False, device=device)
     i = i.float()
     intern = torch.einsum("ijk,kl->ijl", X, self.Wf).add(self.bf)
-    intern.to(device)
     Y, C, d = LstmOp.apply(intern, self.Wr, h0, c0, i, device, self.direction)
     return Y, (C, d)
