@@ -51,7 +51,7 @@ class LstmOpBase(autograd.Function):
     lstm.lstm_backward_op_base(
       ctx.saved_tensors[1], ctx.saved_tensors[3], ctx.saved_tensors[4],
       ctx.saved_tensors[5],
-      grad_outputs[2], ctx.saved_tensors[0], DWr, Dc, grad_outputs[0]
+      grad_outputs[2].contiguous(), ctx.saved_tensors[0], DWr, Dc, grad_outputs[0].contiguous()
     )
     return ctx.saved_tensors[0], DWr, None, Dc, None, None, None
 
@@ -133,4 +133,7 @@ class SingleLayerLstm(nn.Module):
     intern = torch.einsum("ijk,kl->ijl", X, self.Wf) + self.bf
 
     Y, C, d = LstmOpBase.apply(intern, self.Wr, h0, c0, i, device, self.direction)
+
+    if self.direction == -1:
+      Y = Y.index_select(0, idx)
     return Y, (C, d)
