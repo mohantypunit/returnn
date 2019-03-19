@@ -298,7 +298,7 @@ def init_engine(devices):
   global engine
   if BackendEngine.is_theano_selected():
     import Engine
-    engine = Engine(devices)
+    engine = Engine.Engine(devices)
   elif BackendEngine.is_tensorflow_selected():
     import TFEngine
     engine = TFEngine.Engine(config=config)
