@@ -331,6 +331,8 @@ class Device(object):
         if log.verbose[4]: progress_bar(float(pi) / len(self.trainnet.train_params_vars), "calculating gradients ...")
         if hasattr(param,'custom_update'):
           gparam = param.custom_update
+        elif hasattr(param,'live_update') and param.live_update is not None:
+          gparam = 0
         elif update_specs['layers'] and param.layer.name not in update_specs['layers']: #param.name == "encoder_data" or param.name == "W_cls_output_output" or param.name == "W_rec_output":
           gparam = 0
         else:
@@ -474,6 +476,8 @@ class Device(object):
                                     name="tester")
 
     elif self.network_task in ['forward', 'daemon', 'compute_priors']:
+      #live_updates = {p:p.live_update for p in self.testnet.train_params_vars if p.live_update is not None}
+      live_updates = {p: p + 3 for p in self.testnet.train_params_vars if p.live_update is not None}
       output_layer_name = config.value("extract_output_layer_name", "output")
       extractions = config.list('extract', ['log-posteriors'])
       source = output_streams['eval']
@@ -680,10 +684,12 @@ class Device(object):
                                            on_unused_input=config.value('theano_on_unused_input', 'ignore'),
                                            name="extractor")
       else:
+        print(">>>>>>>>>", live_updates, list(live_updates.values()))
+        live_updates[list(live_updates.keys())[0]] = T.ones_like(list(live_updates.keys())[0])
         self.extractor = theano.function(inputs=[],
                                          outputs=source if len(source) == 1 else [T.concatenate(source, axis=-1)],
                                          givens=givens,
-                                         updates=live_updates,
+                                         updates=list(live_updates.items()),
                                          on_unused_input=config.value('theano_on_unused_input', 'ignore'),
                                          name="extractor")
       self.save_graph = config.has('save_graph')

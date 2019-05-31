@@ -534,6 +534,7 @@ class RecurrentUnitLayer(Layer):
                join_states=False,
                state_memory=False,
                sample_segment=None,
+               state_shadow=False,
                **kwargs):
     """
     :param n_out: number of cells
@@ -817,7 +818,7 @@ class RecurrentUnitLayer(Layer):
     assert isinstance(recurrent_transform_inst, RecurrentTransform.RecurrentTransformBase)
     unit.recurrent_transform = recurrent_transform_inst
     self.recurrent_transform = recurrent_transform_inst
-    state_memory *= self.train_flag
+    state_shadow = state_shadow and not self.train_flag
     # scan over sequence
     for s in range(self.attrs['sampling']):
       index = self.index[s::self.attrs['sampling']]
@@ -840,21 +841,19 @@ class RecurrentUnitLayer(Layer):
         i = index[::direction or 1]
         out, _ = theano.map(context_window, sequences = [T.arange(z.shape[0])], non_sequences = [T.concatenate([T.zeros((context - 1,z.shape[1],z.shape[2]),dtype='float32'),z],axis=0), i])
         z = out[0][::direction or 1]
-        i = out[1][::direction or 1]  # T(BC)
+        i = out[1][::direction or 1] # T(BC)
         direction = 1
-        z = z.reshape((time * batch, context * dim))  # (TB)(CD)
-        z = z.reshape((time * batch, context, dim)).dimshuffle(1,0,2)  # C(TB)D
-        i = i.reshape((time * batch, context)).dimshuffle(1,0)  # C(TB)
-
+        z = z.reshape((time * batch, context * dim)) # (TB)(CD)
+        z = z.reshape((time * batch, context, dim)).dimshuffle(1,0,2) # C(TB)D
+        i = i.reshape((time, context, batch)).dimshuffle(1,0,2).reshape((context, time * batch))
         index = i
         num_batches = time * batch
 
       sequences = z
       sources = self.sources
-      if state_memory:
-        self.init_state = [
-          self.add_param(self.shared(numpy.zeros((state_memory or 1, unit.n_units), dtype='float32'), name='init_%d_%s' % (a, self.name)))
-          for a in range(unit.n_act)]  # has to be initialized for train and test
+      self.init_state = [
+        self.add_param(self.shared(numpy.zeros((1, unit.n_units), dtype='float32'), name='init_%d_%s' % (a, self.name)))
+        for a in range(unit.n_act)]
       if encoder:
         if recurrent_transform == "attention_segment":
           if hasattr(encoder[0],'act'):
@@ -863,14 +862,15 @@ class RecurrentUnitLayer(Layer):
            # outputs_info = [ T.concatenate([e[i] for e in encoder], axis=1) for i in range(unit.n_act) ]
             outputs_info[0] = self.aligner.output[-1]
         elif hasattr(encoder[0],'act'):
-          outputs_info = [ T.concatenate([e.act[i][-1] for e in encoder], axis=1) for i in range(unit.n_act) ]
+          outputs_info = [T.concatenate([e.act[i][-1] for e in encoder], axis=1) for i in range(unit.n_act)]
         else:
-          outputs_info = [ T.concatenate([e[i] for e in encoder], axis=1) for i in range(unit.n_act) ]
+          outputs_info = [T.concatenate([e[i] for e in encoder], axis=1) for i in range(unit.n_act)]
         sequences += T.alloc(numpy.cast[theano.config.floatX](0), n_dec, num_batches, unit.n_in) + (self.zc if self.attrs['recurrent_transform'] == 'input' else numpy.float32(0))
-      elif state_memory:
+      elif state_shadow:
         outputs_info = self.init_state
+        outputs_info[0] = print_to_file('is', outputs_info[0])
       else:
-        outputs_info = [ T.alloc(numpy.cast[theano.config.floatX](0), num_batches, unit.n_units) for a in range(unit.n_act) ]
+        outputs_info = [T.alloc(numpy.cast[theano.config.floatX](0), num_batches, unit.n_units) for a in range(unit.n_act)]
 
       if self.attrs['lm'] and self.attrs['droplm'] == 0.0 and (self.train_flag or force_lm):
         if self.network.y[self.attrs['target']].ndim == 3:
@@ -929,6 +929,9 @@ class RecurrentUnitLayer(Layer):
         self.act = [ T.set_subtensor(tot[s::self.attrs['sampling']], act) for tot,act in zip(self.act, outputs) ]
       else:
         self.act = outputs[:unit.n_act]
+        if state_shadow:
+          for i in range(len(self.act)):
+            self.init_state[i].live_update = T.ones_like(self.init_state[i]) #1 #self.act[i][-1]
         if len(outputs) > unit.n_act:
           self.aux = outputs[unit.n_act:]
         if state_memory:
