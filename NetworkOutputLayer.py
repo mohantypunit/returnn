@@ -1,3 +1,6 @@
+
+from __future__ import print_function
+
 import numpy
 import os
 from theano import tensor as T
@@ -8,13 +11,14 @@ from TwoStateBestPathDecoder import TwoStateBestPathDecodeOp
 from CTC import CTCOp
 from TwoStateHMMOp import TwoStateHMMOp
 from OpNumpyAlign import NumpyAlignOp
-from NativeOp import FastBaumWelchOp, SegmentFastBaumWelchOp
+from NativeOp import FastBaumWelchOp, SegmentFastBaumWelchOp, MultiEndFastBaumWelchOp
 from NetworkBaseLayer import Layer
 from NetworkHiddenLayer import CAlignmentLayer
 from SprintErrorSignals import sprint_loss_and_error_signal, SprintAlignmentAutomataOp
 from TheanoUtil import time_batch_make_flat, grad_discard_out_of_bound, DumpOp
 from Util import as_str
 from Log import log
+
 
 class OutputLayer(Layer):
   layer_class = "softmax"
@@ -28,13 +32,15 @@ class OutputLayer(Layer):
                compute_priors=False, compute_priors_exp_average=0, compute_priors_accumulate_batches=None,
                compute_distortions=False,
                softmax_smoothing=1.0, grad_clip_z=None, grad_discard_out_of_bound_z=None, normalize_length=False,
-               exclude_labels=[],
+               exclude_labels=[], include_labels=[],
                apply_softmax=True, batchwise_softmax=False,
                substract_prior_from_output=False,
                input_output_similarity=None,
                input_output_similarity_scale=1,
                scale_by_error=False,
                copy_weights=False,
+               target_delay=0,
+               compute_sequence_weights=False,
                **kwargs):
     """
     :param theano.Variable index: index for batches
@@ -65,6 +71,8 @@ class OutputLayer(Layer):
       self.set_attr("use_source_index", use_source_index)
       src_index = self.sources[0].index
       self.index = src_index
+    if compute_sequence_weights:
+      self.set_attr('compute_sequence_weights', compute_sequence_weights)
     if not copy_input or copy_weights:
       if copy_weights:
         self.params = {}
@@ -182,8 +190,15 @@ class OutputLayer(Layer):
       self.norm = num / T.cast(T.sum(self.index), 'float32')
       self.z = T.set_subtensor(self.z[end:], T.zeros_like(self.z[end:]))
 
+    if target_delay > 0:
+      self.z = T.concatenate([self.z[target_delay:],self.z[-1].dimshuffle('x',0,1).repeat(target_delay,axis=0)],axis=0)
+
     self.set_attr('from', ",".join([s.name for s in self.sources]))
     index_flat = self.index.flatten()
+    assert not (exclude_labels and include_labels)
+    if include_labels:
+      exclude_labels = [ i for i in range(self.attrs['n_out']) if not i in include_labels ]
+    assert len(exclude_labels) < self.attrs['n_out']
     for label in exclude_labels:
       index_flat = T.set_subtensor(index_flat[(T.eq(self.y_data_flat, label) > 0).nonzero()], numpy.int8(0))
     self.i = (index_flat > 0).nonzero()
@@ -192,7 +207,7 @@ class OutputLayer(Layer):
     self.attrs['loss'] = self.loss
     if softmax_smoothing != 1.0:
       self.attrs['softmax_smoothing'] = softmax_smoothing
-      print >> log.v4, "Logits before the softmax scaled with factor ", softmax_smoothing
+      print("Logits before the softmax scaled with factor ", softmax_smoothing, file=log.v4)
       self.z *= numpy.float32(softmax_smoothing)
     if self.loss == 'priori':
       self.priori = self.shared(value=numpy.ones((self.attrs['n_out'],), dtype=theano.config.floatX), borrow=True)
@@ -324,20 +339,21 @@ class OutputLayer(Layer):
                                   custom_update=forward,
                                   custom_update_normalized=True)
       }
-      
+
     self.cost_scale_val = T.constant(1)
     if scale_by_error and self.train_flag:
       rpcx = self.p_y_given_x_flat[T.arange(self.p_y_given_x_flat.shape[0]),self.y_data_flat]
       #rpcx -= rpcx.min()
       rpcx /= rpcx.max()
-      weight = T.constant(1) - rpcx
+      #weight = T.constant(1) - rpcx
       #weight = (T.constant(1) - self.p_y_given_x_flat[T.arange(self.p_y_given_x_flat.shape[0]),self.y_data_flat])
-      weight = weight.dimshuffle(0,'x').repeat(self.z.shape[2],axis=1).reshape(self.z.shape)
-      weight = T.cast(T.neq(T.argmax(self.p_y_given_x_flat, axis=1), self.y_data_flat), 'float32').dimshuffle(0,'x').repeat(self.z.shape[2],axis=1).reshape(self.z.shape)
+      #weight = weight.dimshuffle(0,'x').repeat(self.z.shape[2],axis=1).reshape(self.z.shape)
+      #weight = T.cast(T.neq(T.argmax(self.p_y_given_x_flat, axis=1), self.y_data_flat), 'float32').dimshuffle(0,'x').repeat(self.z.shape[2],axis=1).reshape(self.z.shape)
+      weight = T.cast(T.eq(T.argmax(self.p_y_given_x_flat, axis=1), self.y_data_flat), 'float32').dimshuffle(0,'x').repeat(self.z.shape[2], axis=1).reshape(self.z.shape)
       self.p_y_given_x = T.exp(weight * T.log(self.p_y_given_x))
-      self.z = self.p_y_given_x
-      self.p_y_given_x_flat = self.p_y_given_x.reshape((self.z.shape[0]*self.z.shape[1],self.z.shape[2]))
-      self.y_m = T.reshape(self.z, (self.z.shape[0] * self.z.shape[1], self.z.shape[2]), ndim=2)
+      #self.z = self.p_y_given_x
+      self.p_y_given_x_flat = self.p_y_given_x.reshape((self.p_y_given_x.shape[0]*self.p_y_given_x.shape[1],self.p_y_given_x.shape[2]))
+      self.y_m = T.reshape(self.p_y_given_x, (self.p_y_given_x.shape[0] * self.p_y_given_x.shape[1], self.p_y_given_x.shape[2]), ndim=2)
 
   def create_bias(self, n, prefix='b', name=""):
     if not name:
@@ -433,6 +449,11 @@ class FramewiseOutputLayer(OutputLayer):
           xx = theano.ifelse.ifelse(T.lt(self.y_m[self.i].shape[0], 1), pad(self.y_m[self.i],0,1), self.y_m[self.i])
           yy = theano.ifelse.ifelse(T.lt(self.y_m[self.i].shape[0], 1), pad(self.y_data_flat[self.i],0,1), self.y_data_flat[self.i])
           nll, pcx = T.nnet.crossentropy_softmax_1hot(x=xx, y_idx=yy)
+        elif self.attrs.get('compute_sequence_weights',False):
+          self.y_data_flat = T.set_subtensor(self.y_data_flat[self.j],numpy.int8(0))
+          nll_raw, pcx = T.nnet.crossentropy_softmax_1hot(x=self.y_m, y_idx=self.y_data_flat)
+          self.seq_weight = T.sum(nll_raw.reshape((self.z.shape[0],self.z.shape[1])),axis=0) / T.sum(self.index,axis=0,dtype='float32')
+          nll = nll_raw[self.i]
         else:
           nll, pcx = T.nnet.crossentropy_softmax_1hot(x=self.y_m[self.i], y_idx=self.y_data_flat[self.i])
       else:
@@ -440,6 +461,7 @@ class FramewiseOutputLayer(OutputLayer):
         output = T.clip(self.p_y_given_x_flat[self.i], 1.e-38, 1.e20)
         nll = -T.log(output) * target
         self.norm *= self.p_y_given_x.shape[1] * T.inv(T.sum(self.index))
+
       if self.attrs.get("auto_fix_target_length"):
         return self.norm * theano.ifelse.ifelse(T.eq(self.index.sum(),0), 0.0, T.sum(nll)), known_grads
       else:
@@ -474,6 +496,11 @@ class FramewiseOutputLayer(OutputLayer):
           T.mean(T.sqr(self.y_m[self.i] - self.y_data_flat.reshape(self.y_m.shape)[self.i]), axis=1)), known_grads
     elif self.loss == 'sse_sigmoid':
       return 1.0 / 2.0 * T.nnet.binary_crossentropy(T.clip(self.p_y_given_x_flat[self.i], 1.e-38, 1.0 - 1.e-5), self.y_data_flat[self.i]).mean(), known_grads
+    elif self.loss == 'sigmoid_binary_crossentropy':
+      from theano.tensor.extra_ops import to_one_hot
+      z_s = T.nnet.sigmoid(self.y_m)
+      self.y_s = z_s.reshape(self.z.shape)
+      return T.nnet.binary_crossentropy(T.clip(z_s, 1.e-5, 1 - 1.e-5)[self.i], to_one_hot(self.y_data_flat[self.i],self.attrs['n_out'])).sum(), known_grads
     elif self.loss == "generic_ce":
       # Should be generic for any activation function.
       # (Except when the labels are not independent, such as for softmax.)
@@ -595,7 +622,7 @@ class SequenceOutputLayer(OutputLayer):
     if warp_ctc_lib:
       self.set_attr("warp_ctc_lib", warp_ctc_lib)
     assert self.loss in (
-      'ctc', 'ce_ctc', 'hmm', 'ctc2', 'sprint', 'viterbi', 'fast_bw', 'seg_fast_bw', 'ctc_warp', 'ctc_rasr', 'inv'), 'invalid loss: ' + self.loss
+      'ctc', 'ce_ctc', 'hmm', 'ctc2', 'sprint', 'viterbi', 'fast_bw', 'seg_fast_bw', 'lf_mmi', 'ctc_warp', 'ctc_rasr', 'inv'), 'invalid loss: ' + self.loss
 
   def _handle_old_kwargs(self, kwargs, fast_bw_opts):
     if "loss_with_softmax_prob" in kwargs:
@@ -844,9 +871,8 @@ class SequenceOutputLayer(OutputLayer):
         known_grads[self.trained_softmax_prior_p] = numpy.float32(self.prior_scale) * (bw_sum0 - self.priors * idx_sum)
       self.fast_bw_opts.assert_all_read()
       return err, known_grads
-    elif self.loss == 'seg_fast_bw':
-      from Fsa import BuildSimpleFsaOp
 
+    elif self.loss == 'seg_fast_bw':
       am_score_scales      = self.seg_fast_bw_opts.get('am_score_scales', [1.0])
       const_gradient_scale = self.seg_fast_bw_opts.get('const_gradient_scale', 1.0)
       length_models        = self.seg_fast_bw_opts.get('length_models', [])
@@ -865,6 +891,75 @@ class SequenceOutputLayer(OutputLayer):
                   'dump_targets_interval'     : self.seg_fast_bw_opts.get('dump_targets_interval', None) }
 
       assert len(am_score_scales) > 0
+
+      class BuildSimpleFsaOp(theano.Op):
+        itypes = (T.imatrix,)
+        # the first and last output are actually uint32
+        otypes = (T.fmatrix, T.fvector, T.fmatrix)
+
+        def __init__(self, state_models=None):
+          if state_models is None:
+            state_models = {}
+
+          self.state_models = state_models
+
+        def perform(self, node, inputs, output_storage, params=None):
+          labels = inputs[0]
+
+          from_states = []
+          to_states = []
+          emission_idxs = []
+          seq_idxs = []
+          weights = []
+          start_end_states = []
+
+          cur_state = 0
+          edges = []
+          weights = []
+          start_end_states = []
+          for b in range(labels.shape[1]):
+            seq_start_state = cur_state
+            for l in range(labels.shape[0]):
+              label = labels[l, b]
+              if label < 0:
+                continue
+              state_model = self.state_models.get(labels[l, b], ('default', 0, 0.0))
+              params = state_model[1:]
+              state_model = state_model[0]
+              if state_model == 'default':
+                # default state model where we transition to the next label
+                length_model, edge_weight = params
+                edges.append((cur_state, cur_state + 1, label, length_model, b))
+                weights.append(edge_weight)
+                cur_state += 1
+              elif state_model == 'loop':
+                # allow looping in the current state before proceeding to the next one
+                length_model, fwd_score, loop_score = params
+                edges.append((cur_state, cur_state, label, length_model, b))
+                weights.append(loop_score)
+                edges.append((cur_state, cur_state + 1, label, length_model, b))
+                weights.append(fwd_score)
+                cur_state += 1
+              elif state_model == 'double':
+                # choose between emitting the label once or twice
+                lm_once, lm_twice_1, lm_twice_2, once_score, twice_score = params
+                edges.append((cur_state, cur_state + 2, label, lm_once, b))
+                weights.append(once_score)
+                edges.append((cur_state, cur_state + 1, label, lm_twice_1, b))
+                weights.append(0.5 * twice_score)
+                edges.append((cur_state + 1, cur_state + 2, label, lm_twice_2, b))
+                weights.append(0.5 * twice_score)
+                cur_state += 2
+
+            start_end_states.append([seq_start_state, cur_state])
+
+            cur_state += 1
+
+          edges = sorted(edges, key=lambda e: e[1] - e[0])
+
+          output_storage[0][0] = numpy.asarray(edges, dtype='uint32').T.copy().view(dtype='float32')
+          output_storage[1][0] = numpy.array(weights, dtype='float32')
+          output_storage[2][0] = numpy.asarray(start_end_states, dtype='uint32').T.copy().view(dtype='float32')
 
       edges, weights, start_end_states = BuildSimpleFsaOp(state_models)(self.y)
       fwdbwd, _, pw = SegmentFastBaumWelchOp(**bw_args).make_op()(self.p_y_given_x, batch_idxs, edges, weights, start_end_states,
@@ -887,10 +982,177 @@ class SequenceOutputLayer(OutputLayer):
       known_grads = { self.z: grad }
 
       return err, known_grads
+    elif self.loss == 'lf_mmi':
+      # Get AM scores for current utterances
+      am_scores = -T.log(self.p_y_given_x)
+      am_scale = self.attrs.get("am_scale", 1)
+      if am_scale != 1:
+        am_scale = numpy.float32(am_scale)
+        am_scores *= am_scale
+
+      # Get alignment FST for numerator
+      if self.fast_bw_opts.get("num_fsa_source", "sprint") == "sprint":
+        assert isinstance(self.sprint_opts, dict), "you need to specify sprint_opts in the output layer"
+        edges, weights, start_end_states, state_buffer = SprintAlignmentAutomataOp(self.sprint_opts)(self.network.tags)
+      else:
+        raise Exception("invalid fsa_source %r" % self.fast_bw_opts.get("fsa_source"))
+
+      # Calculate numerator part
+      fwdbwd, obs_scores = FastBaumWelchOp().make_op()(am_scores, edges, weights, start_end_states, float_idx, state_buffer)
+      self.baumwelch_alignment = T.exp(-fwdbwd)
+      self.num_scores = obs_scores
+
+      def loop_fkt(some_variable, seq_index, prev_fwdbwd, prev_scores):
+        # Get search FST for denominator
+        if self.fast_bw_opts.get("den_fsa_source", "file") == "file":
+          import os
+          assert isinstance(self.fast_bw_opts.get("den_fsa_file"), str) and os.path.exists(self.fast_bw_opts.get("den_fsa_file")),\
+            "you need to specify the path to the search FSA in den_fsa_file"
+
+          class LoadWfstOp(theano.Op):
+            """
+            Op: maps segment names (tags) to fsa automata (load from disk) that can be used to compute a BW-alignment
+            """
+
+            __props__ = ("filename",)
+
+            def __init__(self, filename):
+              super(LoadWfstOp, self).__init__()
+              from Util import make_hashable
+              self.filename = make_hashable(filename)
+              self.single_wfst = None  # type: dict
+
+            def make_node(self, tags):
+              # the edges/start_end_state output has to be a float matrix because that is the only dtype supported
+              # by CudaNdarray. We need unsigned ints. Thus we return a view on the unsigned int matrix
+              return theano.Apply(self, [tags],
+                                  [T.fmatrix(), T.fvector(), T.fvector(), T.fmatrix(), T.fvector(), T.fmatrix()])
+
+            def perform(self, node, inputs, output_storage, params=None):
+              tags = inputs[0]
+              try:
+                _ = iter(tags)
+              except TypeError:
+                tags = [tags]
+
+              if self.single_wfst is None:
+                print("LoadWfstOp: Loading WFST from %r" % self.filename, file=log.v3)
+                import xml.etree.ElementTree as ET
+
+                tree = ET.parse(self.filename)
+                root = tree.getroot()
+                single_wfst = dict()
+                single_wfst['edges'] = []
+                single_wfst['weights'] = []
+                single_wfst['start_states'] = numpy.array([root.attrib['initial']], dtype=numpy.uint32)
+                single_wfst['end_states'] = []
+                single_wfst['end_state_weigths'] = []
+                self.single_wfst = dict()
+                self.single_wfst['num_states'] = len(root)
+
+                for state in root:
+                  if state.tag != 'state':
+                    continue  # not interested in input-alphabet
+                  state_id = numpy.uint32(state.attrib['id'])
+                  if state[0].tag == 'final':
+                    single_wfst['end_states'].append([numpy.uint32(0), state_id])
+                    if state[1].tag == 'weight':
+                      single_wfst['end_state_weigths'].append(numpy.float32(state[1].text))
+                    else:
+                      single_wfst['end_state_weigths'].append(numpy.float32(0.))
+                  for arc in state:
+                    if arc.tag != 'arc':
+                      continue  # alredy handeled 'final' and 'weight'
+                    target = numpy.uint32(arc.attrib['target'])
+                    emission_id = numpy.uint32(arc[0].text)
+                    if len(arc) > 1:
+                      weight = numpy.float32(arc[1].text)
+                    else:
+                      weight = numpy.float32(0.)
+                    single_wfst['edges'].append([state_id, target, emission_id, numpy.uint32(0)])
+                    single_wfst['weights'].append(weight)
+                for key, val in single_wfst.items():
+                  self.single_wfst[key] = numpy.array(val)
+
+              assert isinstance(self.single_wfst, dict)  # PyCharm confused otherwise
+
+              offset = 0
+              all_edges = []
+              all_weights = []
+              all_start_states = []
+              all_end_states = []
+              all_end_state_weigths = []
+              for tag in tags:
+                edges = numpy.transpose(numpy.copy(self.single_wfst['edges']))
+                edges[0:2, :] += offset
+                edges[3, :] = tag
+                all_edges.append(edges)
+                all_weights.append(self.single_wfst['weights'])
+                all_start_states.append(self.single_wfst['start_states'] + offset)
+                end_states = numpy.copy(self.single_wfst['end_states'])
+                end_states[:, 1] += offset
+                end_states[:, 0] = tag
+                all_end_states.append(end_states)
+                all_end_state_weigths.append(self.single_wfst['end_state_weigths'])
+                offset += self.single_wfst['num_states']
+
+              output_storage[0][0] = numpy.hstack(all_edges).view(dtype='float32')
+              output_storage[1][0] = numpy.hstack(all_weights)
+              output_storage[2][0] = numpy.hstack(all_start_states).view(dtype='float32')
+              output_storage[3][0] = numpy.hstack(all_end_states).view(dtype='float32')
+              output_storage[4][0] = numpy.hstack(all_end_state_weigths)
+              output_storage[5][0] = numpy.empty((2, self.single_wfst['num_states'] * len(tags)), dtype='float32')
+
+          edges, weights, start_states, end_states, end_state_weigths, state_buffer = LoadWfstOp(self.fast_bw_opts.get("den_fsa_file"))(seq_index)
+        else:
+          raise Exception("invalid fsa_source %r" % self.fast_bw_opts.get("fsa_source"))
+
+        # Calculate denominator part
+        fwdbwd, obs_scores = MultiEndFastBaumWelchOp().make_op()(am_scores, edges, weights, start_states, end_states, end_state_weigths, float_idx, state_buffer)
+        return T.set_subtensor(prev_fwdbwd[:,seq_index,:], fwdbwd[:,seq_index,:]) , T.set_subtensor(prev_scores[:,seq_index], obs_scores[:,seq_index])
+
+      [foo,bar], scan_updates = theano.scan(fn=loop_fkt,
+                                            outputs_info=[T.zeros_like(fwdbwd),T.zeros_like(obs_scores)],
+                                            sequences=[am_scores[0],T.arange(1000)])
+
+      [fwdbwd, obs_scores] = [foo[-1],bar[-1]]
+
+      self.baumwelch_denominator =T.exp(-fwdbwd)
+      self.den_scores = obs_scores
+
+      # TODO: check weather loss is correct
+      err = ((self.num_scores - self.den_scores) *  T.cast(self.index,'float32') / T.sum( T.cast(self.index,'float32'), axis=0, dtype='float32', keepdims=True)).sum()
+
+      if self.fast_bw_opts.get('numerator_smoothing') :
+        num = (1 - self.fast_bw_opts.get('numerator_smoothing')) * self.baumwelch_alignment + self.fast_bw_opts.get('numerator_smoothing') * T.extra_ops.to_one_hot(self.y_data_flat, self.baumwelch_alignment.shape[-1]).reshape(self.baumwelch_alignment.shape)
+      else:
+        num = self.baumwelch_alignment
+
+      grad = (self.baumwelch_denominator - num) * float_idx_bc
+
+      if self.ce_smoothing:
+        err *= numpy.float32(1.0 - self.ce_smoothing)
+        grad *= numpy.float32(1.0 - self.ce_smoothing)
+        if not self.prior_scale:  # we kept the softmax bias as it was
+          nll, pcx = T.nnet.crossentropy_softmax_1hot(x=self.y_m[self.i], y_idx=self.y_data_flat[self.i])
+        else:  # assume that we have subtracted the bias by the log priors beforehand
+          assert self.log_prior is not None
+          # In this case, for the CE calculation, we need to add the log priors again.
+          y_m_prior = T.reshape(self.z + numpy.float32(self.prior_scale) * self.log_prior,
+                                (self.z.shape[0] * self.z.shape[1], self.z.shape[2]), ndim=2)
+          nll, pcx = T.nnet.crossentropy_softmax_1hot(x=y_m_prior[self.i], y_idx=self.y_data_flat[self.i])
+        ce = numpy.float32(self.ce_smoothing) * T.sum(nll)
+        err += ce
+        grad += T.grad(ce, self.z)
+
+
+      return err, {self.z: grad }
+
     elif self.loss == 'ctc':
       from theano.tensor.extra_ops import cpu_contiguous
       err, grad, priors = CTCOp()(self.p_y_given_x, cpu_contiguous(self.y.dimshuffle(1, 0)), self.index_for_ctc())
       known_grads = {self.z: grad * numpy.float32(self.attrs.get('cost_scale', 1))}
+      self.seq_weight = err / T.sum(self.index_for_ctc(),axis=0,dtype='float32')
       return err.sum(), known_grads, priors.sum(axis=0)
     elif self.loss == 'hmm':
       from theano.tensor.extra_ops import cpu_contiguous

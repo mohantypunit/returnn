@@ -586,7 +586,7 @@ class Layer(Container):
       # Or shape[0]==1 with index[0]==0. See Dataset.shapes_for_batches().
       # Use source index in that case.
       have_zero = T.le(index.shape[0], 1) * T.eq(T.sum(index[0]), 0)
-      index = ifelse(have_zero, self.sources[0].index, index)
+      index = ifelse(have_zero, T.cast(self.sources[0].index,'int8'), T.cast(index,'int8'))
     return index
 
   def find_data_layer(self):
@@ -601,13 +601,14 @@ class Layer(Container):
 
   def add_param(self, param, name="", constraints=True,
                 custom_update=None, custom_update_normalized=False, custom_update_exp_average=0,
-                custom_update_condition=None, custom_update_accumulate_batches=None):
+                custom_update_condition=None, custom_update_accumulate_batches=None, live_update=None):
     """
     :type param: theano.SharedVariable
     :type name: str
     :rtype: theano.SharedVariable
     """
     param = super(Layer, self).add_param(param, name)
+    param.live_update = live_update
     if custom_update:
       # Handled in Device and Updater.
       param.custom_update = custom_update

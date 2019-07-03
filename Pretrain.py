@@ -1,9 +1,11 @@
 
+"""
+This module contains pretrain related code.
+This is independent from the backend (TF or Theano, etc).
+"""
+
 from __future__ import print_function
 
-from Network import LayerNetwork
-from NetworkBaseLayer import Layer
-from NetworkCopyUtils import intelli_copy_layer, LayerDoNotMatchForCopy
 from Log import log
 from Util import unicode, long
 
@@ -15,23 +17,47 @@ class WrapEpochValue:
   This is going to be part in your network description dict.
   """
   def __init__(self, func):
+    """
+    :param ((epoch: int) -> object) func: function which should accept one kwd-arg 'epoch'
+    """
     self.func = func
 
   def get_value(self, epoch):
+    """
+    :param int epoch:
+    :return: anything, whatever self.func returns
+    :rtype: object
+    """
     return self.func(epoch=epoch)
 
 
 def find_pretrain_wrap_values(net_json):
+  """
+  See also :func:`Pretrain._resolve_wrapped_values`.
+  Recursively goes through dicts, tuples and lists.
+  This is a simple check to see if this is needed,
+  i.e. if there are any :class:`WrapEpochValue` used.
+
+  :param dict[str] net_json: network dict
+  :return: whether there is some :class:`WrapEpochValue` in it
+  :rtype: bool
+  """
   assert isinstance(net_json, dict)
-  def _check_dict(d):
-    for k, v in sorted(d.items()):
-      if isinstance(v, dict):
-        if _check_dict(v):
+
+  def _check(d):
+    if isinstance(d, WrapEpochValue):
+      return True
+    if isinstance(d, dict):
+      for k, v in sorted(d.items()):
+        if _check(v):
           return True
-      if isinstance(v, WrapEpochValue):
-        return True
+    if isinstance(d, (tuple, list)):
+      for v in d:
+        if _check(v):
+          return True
     return False
-  return _check_dict(net_json)
+
+  return _check(net_json)
 
 
 class Pretrain:
@@ -42,38 +68,56 @@ class Pretrain:
   """
   # Note: If we want to add other pretraining schemes, make this a base class.
 
-  def __init__(self, original_network_json, network_init_args, copy_output_layer=None, greedy=None, repetitions=None, construction_algo=None):
+  def __init__(self, original_network_json, network_init_args=None,
+               copy_param_mode=None, copy_output_layer=None, greedy=None,
+               repetitions=None,
+               construction_algo="from_output", output_layers=("output",), input_layers=("data",)):
     """
     :type original_network_json: dict[str]
-    :param dict[str] network_init_args: additional args we use for LayerNetwork.from_json().
-      must have n_in, n_out.
+    :param dict[str]|None network_init_args: additional args we use for LayerNetwork.from_json().
+      must have n_in, n_out. (for Theano only, thus optional now)
+    :param str copy_param_mode:
     :param bool|str copy_output_layer: whether to copy the output layer params from last epoch or reinit
     :param bool greedy: if True, only train output+last layer, otherwise train all
     :param None | int | list[int] | dict repetitions: how often to repeat certain pretrain steps. default is one epoch.
       It can also be a dict, with keys like 'default' and 'final'. See code below.
-    :param str construction_algo: e.g. "from_output"
+    :param str|callable construction_algo: e.g. "from_output"
+    :param list[str]|tuple[str] output_layers: used for construction
+    :param list[str]|tuple[str] input_layers: used for construction
     """
+    assert copy_param_mode in [None, "ifpossible", "subset"]
+    if copy_output_layer is None:
+      copy_output_layer = copy_param_mode
     if copy_output_layer is None:
       copy_output_layer = "ifpossible"
     if copy_output_layer:
-      assert copy_output_layer is True or copy_output_layer == "ifpossible"
+      assert copy_output_layer is True or copy_output_layer in ["ifpossible", "subset"]
+    self.copy_param_mode = copy_param_mode
     self.copy_output_layer = copy_output_layer
     if greedy is None:
       greedy = False
     self.greedy = greedy
     self.network_init_args = network_init_args
-    assert "n_in" in network_init_args
-    assert "n_out" in network_init_args
     self._original_network_json = original_network_json
-    if not construction_algo:
-      construction_algo = "from_output"
     self._construction_algo = construction_algo
-    getattr(self, "_construct_epochs_%s" % construction_algo)()
-    self._remove_non_trainable_added_only()
+    self._input_layers = input_layers
+    self._output_layers = output_layers
+    if construction_algo == "from_input":
+      self._construct_epochs_from_input()
+    elif construction_algo == "from_output":
+      self._construct_epochs_from_output()
+    elif callable(construction_algo):
+      self._construct_epochs_custom(construction_algo)
+    elif construction_algo == "no_network_modifications":
+      self._construct_epochs_no_network_modifications()
+    else:
+      raise Exception("invalid construction_algo %r" % construction_algo)
+    if not callable(construction_algo):  # if callable, trust the user
+      self._remove_non_trainable_added_only()
     if not repetitions:
       repetitions = 1
     if isinstance(repetitions, dict):
-      rep_dict = repetitions
+      rep_dict = repetitions.copy()
       default_rep = rep_dict.pop('default', 1)
       repetitions = [default_rep] * len(self._step_net_jsons)
       for k, v in sorted(rep_dict.items()):
@@ -88,6 +132,10 @@ class Pretrain:
       assert 0 < len(repetitions) <= len(self._step_net_jsons)
       if len(repetitions) < len(self._step_net_jsons):
         repetitions = repetitions + [repetitions[-1]] * (len(self._step_net_jsons) - len(repetitions))
+    assert len(repetitions) == len(self._step_net_jsons)
+    for i, net_dict in enumerate(self._step_net_jsons):
+      if "#repetition" in net_dict:
+        repetitions[i] = net_dict.pop("#repetition")
     self.repetitions = repetitions
     self._make_repetitions()
     self._resolve_wrapped_values()
@@ -111,16 +159,15 @@ class Pretrain:
       assert isinstance(net2, dict)
       for l in sorted(net1.keys()):
         assert l in net2
-      have_new = False
       have_new_trainable = False
       for l in sorted(net2.keys()):
-        if self._is_layer_output(net2, l): continue  # ignore output layers
-        if l in net1: continue  # already had before
-        have_new = True
+        if self._is_layer_output(net2, l):
+          continue  # ignore output layers
+        if l in net1:
+          continue  # already had before
         if net2[l].get("trainable", True):
           have_new_trainable = True
           break
-      #assert have_new, "i: %i,\nold: %r,\nnew: %r" % (i, sorted(net1.keys()), sorted(net2.keys()))
       if have_new_trainable:
         self._step_net_jsons.append(net2)
     # Always add final net.
@@ -132,35 +179,61 @@ class Pretrain:
     old_net_jsons = self._step_net_jsons
     self._step_net_jsons = []
     for n_rep, net_json in zip(self.repetitions, old_net_jsons):
-      for i in range(n_rep):
+      for _ in range(n_rep):
         self._step_net_jsons.append(deepcopy(net_json))
 
   def _resolve_wrapped_values(self):
-    def _check_dict(d, epoch):
+    """
+    Resolves any :class:`WrapEpochValue` in the net dicts.
+    Recursively goes through dicts, tuples and lists.
+    See also :func:`find_pretrain_wrap_values`.
+    """
+
+    # noinspection PyShadowingNames
+    def _check_dict(d, epoch, depth=0):
       for k, v in sorted(d.items()):
-        assert isinstance(k, (str, unicode))
-        if isinstance(v, dict):
-          _check_dict(v, epoch=epoch)
-        if isinstance(v, WrapEpochValue):
-          d[k] = v.get_value(epoch=epoch)
+        if depth <= 1:  # 0 - layers, 1 - layer opts
+          assert isinstance(k, (str, unicode))
+        d[k] = _check(v, epoch=epoch, depth=depth + 1)
+
+    # noinspection PyShadowingNames
+    def _check(v, epoch, depth):
+      """
+      :param WrapEpochValue|tuple|list|dict|T v:
+      :param int epoch:
+      :param int depth:
+      :rtype: T
+      """
+      if isinstance(v, WrapEpochValue):
+        return v.get_value(epoch=epoch)
+      if isinstance(v, (tuple, list)):
+        if not any([isinstance(x, WrapEpochValue) for x in v]):
+          return v
+        return type(v)([_check(x, epoch=epoch, depth=depth + 1) for x in v])
+      if isinstance(v, dict):
+        _check_dict(v, epoch=epoch, depth=depth)
+        return v
+      return v
+
     for i, net_json in enumerate(self._step_net_jsons):
       epoch = i + 1
       _check_dict(net_json, epoch=epoch)
 
+  # noinspection PyMethodMayBeStatic
   def _find_layer_descendants(self, json, sources):
-    l = []
+    ls = []
     for other_layer_name, other_layer in sorted(json.items()):
-      if other_layer_name in l:
+      if other_layer_name in ls:
         continue
       other_sources = other_layer.get("from", ["data"])
       for src in sources:
         if src in other_sources:
-          l.append(other_layer_name)
+          ls.append(other_layer_name)
           break
-    return l
+    return ls
 
   def _is_layer_output(self, json, layer_name):
-    if layer_name == "output":
+    if layer_name in self._output_layers:
       return True
     if json[layer_name]["class"] == "softmax":
       return True
@@ -184,18 +257,21 @@ class Pretrain:
           sources.remove(v)
     return outs
 
-  def _find_existing_inputs(self, json, layer_name):
-    l = []
+  def _find_existing_inputs(self, json, layer_name, _collected=None, _visited=None):
+    if _collected is None:
+      _collected = []
+    if _visited is None:
+      _visited = {layer_name: None}
     sources = self._original_network_json[layer_name].get("from", ["data"])
     for src in sources:
       if src in json or src == "data":
-        if src not in l:
-          l.append(src)
+        if src not in _collected:
+          _collected.append(src)
       else:
-        for csrc in self._find_existing_inputs(json, src):
-          if csrc not in l:
-            l.append(csrc)
-    return l
+        if src not in _visited:
+          _visited[src] = layer_name
+          self._find_existing_inputs(json=json, layer_name=src, _collected=_collected, _visited=_visited)
+    return _collected
 
   def _construct_next_epoch_from_input(self, num_steps):
     """
@@ -207,7 +283,12 @@ class Pretrain:
     sources = ["data"]
     # Keep track of other layers which need to be added to make it complete.
     needed = set()
+
+    # noinspection PyShadowingNames
     def update_needed(l):
+      """
+      :param str l:
+      """
       needed.update(set(new_net[l].get("from", ["data"])).difference(list(new_net.keys()) + ["data"]))
     # First search for non-trainable layers (like input windows or so).
     # You must specify "trainable": False in the layer at the moment.
@@ -228,7 +309,7 @@ class Pretrain:
       if not added_something:
         break
     # First do a search of depth `num_steps` through the net.
-    for i in range(num_steps):
+    for _ in range(num_steps):
       descendants = self._find_layer_descendants(self._original_network_json, sources)
       sources = []
       for l in descendants:
@@ -280,28 +361,33 @@ class Pretrain:
     from copy import deepcopy
     new_json = deepcopy(self._step_net_jsons[0])
     while True:
-      assert "output" in new_json
+      for out_layer_name in self._output_layers:
+        assert out_layer_name in new_json
       # From the sources of the output layer, collect all their sources.
       # Then remove the direct output sources and replace them with the indirect sources.
       new_sources = set()
       deleted_sources = set()
-      for source in new_json["output"]["from"]:
-        # Except for data sources. Just keep them.
-        if source == "data":
-          new_sources.add("data")
-        else:
-          assert source in new_json, "error %r, n: %i, last: %s" % (source, len(self._step_net_jsons), self._step_net_jsons[0])
-          new_sources.update(new_json[source].get("from", ["data"]))
-          del new_json[source]
-          deleted_sources.add(source)
+      for out_layer_name in self._output_layers:
+        for source in new_json[out_layer_name]["from"]:
+          # Except for data sources. Just keep them.
+          if source in self._input_layers:
+            new_sources.add(source)
+          else:
+            assert source in new_json, "error %r, n: %i, last: %s" % (
+              source, len(self._step_net_jsons), self._step_net_jsons[0])
+            new_sources.update(new_json[source].get("from", ["data"]))
+            del new_json[source]
+            deleted_sources.add(source)
       # Check if anything changed.
       # This is e.g. not the case if the only source was data.
-      if list(sorted(new_sources)) == list(sorted(new_json["output"]["from"])):
+      if list(sorted(new_sources)) == list(sorted(set(sum(
+            [new_json[name]["from"] for name in self._output_layers], [])))):
         return False
-      new_json["output"]["from"] = list(sorted(new_sources))
+      for out_layer_name in self._output_layers:
+        new_json[out_layer_name]["from"] = list(sorted(new_sources))
       # If we have data input, it likely means that the input dimension
       # for the output layer would change. Just avoid that for now.
-      if "data" in new_sources:
+      if new_sources.intersection(set(self._input_layers)):
         # Try again.
         continue
       # If all deleted sources were non-trainable, skip this.
@@ -316,6 +402,24 @@ class Pretrain:
     while self._construct_new_epoch_from_output():
       pass
 
+  def _construct_epochs_custom(self, func):
+    """
+    :param ((idx: int, net_dict: dict[str,dict[str]]) -> dict[str,dict[str]]|None) func:
+      ``func`` can work inplace on net_dict and should then return it.
+      If ``None`` is returned, it will stop with the construction.
+      The original network will always be added at the end.
+    """
+    from copy import deepcopy
+    self._step_net_jsons = []
+    idx = 0
+    while True:
+      d = func(idx=idx, net_dict=deepcopy(self._original_network_json))
+      if not d:
+        break
+      self._step_net_jsons.append(d)
+      idx += 1
+    self._step_net_jsons.append(self._original_network_json)
+
   def _construct_epochs_no_network_modifications(self):
     self._step_net_jsons = [self._original_network_json]
 
@@ -327,9 +431,15 @@ class Pretrain:
             self.get_train_num_epochs(), self.repetitions)
 
   def get_train_num_epochs(self):
+    """
+    :rtype: int
+    """
     return len(self._step_net_jsons)
 
   def get_final_network_json(self):
+    """
+    :rtype: dict[str,dict[str]]
+    """
     return self._step_net_jsons[-1]
 
   def get_network_json_for_epoch(self, epoch):
@@ -345,8 +455,11 @@ class Pretrain:
   def get_network_for_epoch(self, epoch, mask=None):
     """
     :type epoch: int
+    :param mask:
     :rtype: Network.LayerNetwork
     """
+    from Network import LayerNetwork
+    from NetworkBaseLayer import Layer
     json_content = self.get_network_json_for_epoch(epoch)
     Layer.rng_seed = epoch
     return LayerNetwork.from_json(json_content, mask=mask, **self.network_init_args)
@@ -364,13 +477,15 @@ class Pretrain:
 
     # network.output is the remaining output layer.
     if self.copy_output_layer:
+      from NetworkCopyUtils import intelli_copy_layer, LayerDoNotMatchForCopy
       for layer_name in new_network.output.keys():
         assert layer_name in old_network.output
         try:
           intelli_copy_layer(old_network.output[layer_name], new_network.output[layer_name])
         except LayerDoNotMatchForCopy:
           if self.copy_output_layer == "ifpossible":
-            print("Pretrain: Can not copy output layer %s, will leave it randomly initialized" % layer_name, file=log.v4)
+            print("Pretrain: Can not copy output layer %s, will leave it randomly initialized" % layer_name,
+                  file=log.v4)
           else:
             raise
     else:
@@ -395,34 +510,44 @@ class Pretrain:
     return {"hidden_layer_selection": new_hidden_layer_names, "with_output": True}
 
 
-def pretrainFromConfig(config):
+def pretrain_from_config(config):
   """
   :type config: Config.Config
   :rtype: Pretrain | None
   """
-  pretrainType = config.value("pretrain", "")
-  if pretrainType == "default":
-    network_init_args = LayerNetwork.init_args_from_config(config)
-    original_network_json = LayerNetwork.json_from_config(config)
-    copy_output_layer = config.bool_or_other("pretrain_copy_output_layer", "ifpossible")
-    greedy = config.bool("pretrain_greedy", None)
-    if config.is_typed("pretrain_repetitions"):
-      repetitions = config.typed_value("pretrain_repetitions")
+  import Util
+  from Config import network_json_from_config
+  pretrain_type = config.bool_or_other("pretrain", None)
+  if pretrain_type == "default" or (isinstance(pretrain_type, dict) and pretrain_type) or pretrain_type is True:
+    if Util.BackendEngine.is_theano_selected():
+      from Network import LayerNetwork
+      network_init_args = LayerNetwork.init_args_from_config(config)
     else:
-      repetitions = config.int_list("pretrain_repetitions", None)
-    construction_algo = config.value("pretrain_construction_algo", None)
-    return Pretrain(original_network_json=original_network_json,
-                    network_init_args=network_init_args,
-                    copy_output_layer=copy_output_layer,
-                    greedy=greedy, repetitions=repetitions,
-                    construction_algo=construction_algo)
-  elif pretrainType == "":
+      network_init_args = None
+    original_network_json = network_json_from_config(config)
+    opts = config.get_of_type("pretrain", dict, {})
+    if config.has("pretrain_copy_output_layer"):
+      opts.setdefault("copy_output_layer", config.bool_or_other("pretrain_copy_output_layer", "ifpossible"))
+    if config.has("pretrain_greedy"):
+      opts.setdefault("greedy", config.bool("pretrain_greedy", None))
+    if config.has("pretrain_repetitions"):
+      if config.is_typed("pretrain_repetitions"):
+        opts.setdefault("repetitions", config.typed_value("pretrain_repetitions"))
+      else:
+        opts.setdefault("repetitions", config.int_list("pretrain_repetitions", None))
+    if config.has("pretrain_construction_algo"):
+      opts.setdefault("construction_algo", config.value("pretrain_construction_algo", None))
+    return Pretrain(original_network_json=original_network_json, network_init_args=network_init_args, **opts)
+  elif not pretrain_type:
     return None
   else:
-    raise Exception("unknown pretrain type: %s" % pretrainType)
+    raise Exception("unknown pretrain type: %s" % pretrain_type)
 
 
 def demo():
+  """
+  Will print out the different network topologies of the specified pretraining scheme.
+  """
   import better_exchook
   better_exchook.install()
   import rnn
@@ -430,15 +555,16 @@ def demo():
   if len(sys.argv) <= 1:
     print("usage: python %s [config] [other options]" % __file__)
     print("example usage: python %s ++pretrain default ++pretrain_construction_algo from_input" % __file__)
-  rnn.initConfig(commandLineOptions=sys.argv[1:])
+  rnn.init_config(command_line_options=sys.argv[1:])
+  # noinspection PyProtectedMember
   rnn.config._hack_value_reading_debug()
   rnn.config.update({"log": []})
-  rnn.initLog()
-  rnn.initBackendEngine()
+  rnn.init_log()
+  rnn.init_backend_engine()
   if not rnn.config.value("pretrain", ""):
     print("config option 'pretrain' not set, will set it for this demo to 'default'")
     rnn.config.set("pretrain", "default")
-  pretrain = pretrainFromConfig(rnn.config)
+  pretrain = pretrain_from_config(rnn.config)
   print("pretrain: %s" % pretrain)
   num_pretrain_epochs = pretrain.get_train_num_epochs()
   from pprint import pprint
@@ -452,4 +578,8 @@ def demo():
 if __name__ == "__main__":
   import sys
   sys.modules["Pretrain"] = sys.modules["__main__"]
-  demo()
+  try:
+    demo()
+  except BrokenPipeError:
+    print("BrokenPipeError")
+    sys.exit(1)

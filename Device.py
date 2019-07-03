@@ -20,82 +20,13 @@ except ImportError:
   from _thread import start_new_thread
 import Debug
 import re
-
-
-
-def have_gpu():
-  cpus, gpus = get_num_devices()
-  return gpus > 0
-
-
-def _consider_check_for_gpu():
-  """
-  There are cases where nvidia-smi could hang.
-  (Any read of /proc/modules might hang in that case, maybe caused
-   by trying to `modprobe nvidia` to check if there is a Nvidia card.)
-  This sometimes happens in our SGE cluster on nodes without Nvidia cards.
-  Maybe it's also a Linux Kernel bug.
-  Anyway, just avoid any such check if we don't asked for a GPU.
-  """
-  theano_flags = {key: value for (key, value)
-                  in [s.split("=", 1) for s in os.environ.get("THEANO_FLAGS", "").split(",") if s]}
-  if "device" in theano_flags:
-    dev = theano_flags["device"]
-    if dev.startswith("gpu") or dev.startswith("cuda"):
-      return True
-    # THEANO_FLAGS will overwrite this config option. See rnn.initDevices().
-    return False
-  try:
-    from Config import get_global_config
-    config = get_global_config()
-  except Exception:
-    config = None
-  if config:
-    for dev in config.list('device', []):
-      if dev.startswith("gpu") or dev.startswith("cuda"):
-        return True
-      if dev == "all":
-        return True
-  return False
-
-
-def get_num_devices():
-  if os.name == 'nt':
-    return 1, 1 #TODO
-  elif sys.platform == 'darwin':
-      #TODO parse via xml output
-      return int(cmd("sysctl -a | grep machdep.cpu.core_count | awk '{print $2}'")[0]),\
-               len(cmd("system_profiler SPDisplaysDataType | grep 'Chipset Model: NVIDIA' | cat"))
-  else:
-    num_cpus = len(cmd('cat /proc/cpuinfo | grep processor')) or 1
-    num_gpus = 0
-    if _consider_check_for_gpu():
-      try:
-        num_gpus = len(cmd('nvidia-smi -L'))
-      except CalledProcessError:
-        pass
-    return num_cpus, num_gpus
-
-
-def get_gpu_names():
-  if not _consider_check_for_gpu():
-    return []
-  if os.name == 'nt':
-    return "GeForce GTX 770" #TODO
-  elif sys.platform == 'darwin':
-    #TODO parse via xml output
-    return cmd("system_profiler SPDisplaysDataType | "
-               "grep 'Chipset Model: NVIDIA' | "
-               "sed 's/.*Chipset Model: NVIDIA *//;s/ *$//'")
-  else:
-    try:
-      return cmd('nvidia-smi -L | cut -d \'(\' -f 1 | cut -d \' \' -f 3- | sed -e \'s/\\ $//\'')
-    except CalledProcessError:
-      return []
+from Util import get_num_gpu_devices
 
 
 def get_device_attributes():
   # (shaders / CUDA cores, clock in MHz, memory in bytes)
+  # https://en.wikipedia.org/wiki/GeForce_10_series
+  # https://en.wikipedia.org/wiki/List_of_Nvidia_graphics_processing_units
   attributes = {
                  "default" : (1000, 1020, 2 * 1024 * 1024 * 1024),
                  "GeForce GTX 580" : (512, 1714, 2 * 1024 * 1024 * 1024),
@@ -111,8 +42,9 @@ def get_device_attributes():
                  "GeForce GTX 970" : (1664, 1178, 4 * 1024 * 1024 * 1024),
                  "GeForce GTX 980" : (2048, 1126, 4 * 1024 * 1024 * 1024),
                  "GeForce GTX 980 Ti" : (2048, 1126, 4 * 1024 * 1024 * 1024),
+                 "GeForce GTX 1080 Ti" : (3584, 1480, 11 * 1024 * 1024 * 1024),
                  "GeForce GTX TITAN" : (2688, 837, 6 * 1024 * 1024 * 1024),
-                 "Geforce GTX TITAN X" : (3072, 1000, 12 * 1024 * 1024 * 1024),
+                 "Geforce GTX TITAN X" : (3584, 1417, 12 * 1024 * 1024 * 1024),
                  "GeForce GT 540M" : (2688, 837, 2 * 1024 * 1024 * 1024),
                  "Tesla K20c" : (2496, 706, 5 * 1024 * 1024 * 1024),
                  }
@@ -124,7 +56,7 @@ def get_device_attributes():
     if sys.platform == 'darwin':
       mhz = int(float(cmd("system_profiler  SPHardwareDataType | "
                           "grep 'Processor Speed' | awk '{print $3}'")[0].replace(',','.')) * 1024)
-      for i in range(get_num_devices()[0]):
+      for i in range(get_num_gpu_devices()[0]):
         attributes["cpu" + str(cpu)] = (1, mhz, 2 * 1024 * 1024 * 1024)
         cpu += 1
     else:
@@ -135,84 +67,6 @@ def get_device_attributes():
   if not cpu:
     attributes["cpu0"] = (1, 1000, 2 * 1024 * 1024 * 1024)
   return attributes
-
-
-TheanoFlags = {key: value for (key, value) in [s.split("=", 1) for s in os.environ.get("THEANO_FLAGS", "").split(",") if s]}
-
-
-def getDevicesInitArgs(config):
-  """
-  :type config: Config.Config
-  :rtype: list[dict[str]]
-  """
-  multiproc = config.bool('multiprocessing', True)
-  if config.value('task', 'train') == "theano_graph":
-    # Should have been reset earlier. See init() which handles this case.
-    assert not multiproc, "set multiprocessing = False to use theano_graph"
-  device_info = config.list('device', ['cpu0'])
-  if len(device_info) == 1 and device_info[0] == 'json':
-    try:
-      import json
-      specs = json.loads(open(config.value('initialize_from_json', '')).read().replace('(','\"').replace(')','\"'))['worker']
-    except Exception:
-      raise Exception('Unable to parse worker information from json content')
-    devices = [ { 'device' : specs[key]['device'], 'config' : config, 'blocking' : False, 'num_batches' : specs[key].pop('num_batches', 1), "update_specs" : specs[key].pop('update_specs', {}) } for key in specs ]
-  else:
-    device_tags = {}
-    ngpux = 0
-    ncpus, ngpus = get_num_devices()
-    if "all" in device_info:
-      device_tags = { tag: [1,True] for tag in [ "cpu" + str(i) for i in range(ncpus)] + [ "gpu" + str(i) for i in range(ngpus)] }
-    else:
-      for info in device_info:
-        device_update = True
-        num_batches = 1
-        if info[0] == '_':
-          device_update = False
-          info = info[1:]
-        if ':' in info:
-          num_batches = int(info.split(':')[1])
-          info = info.split(':')[0]
-        if len(info) == 3: info += "X"
-        assert len(info) > 3, "invalid device: " + str(info) #str(info[:-1])
-        utype = info[0:3]
-        uid = info[3:]
-        if uid == '*': uid = "[0-9]*"
-        if uid == 'X':
-          ngpux += 1
-          device_tags[info] = [num_batches, True]
-        else:
-          if utype == 'cpu':
-            np = ncpus
-          elif utype == 'gpu':
-            np = ngpus
-          else:
-            np = 0
-          match = False
-          for p in range(np):
-            if re.match(uid, str(p)):
-              device_tags[utype + str(p)] = [num_batches, device_update]
-              match = True
-          assert match, "invalid device specified: " + info
-    tags = sorted(device_tags.keys())
-    if multiproc:
-      assert len(tags) > 0
-      if len(tags) == 1 and tags[0][-1] == 'X':
-        newtag = tags[0][:-1] + 'Z'
-        device_tags[newtag] = device_tags[tags[0]]
-        tags[0] = newtag
-      devices = [ {"device": tag, "config": config, "num_batches": device_tags[tag][0], "update_specs" : {'update_rule' : 'global' if device_tags[tag][1] else 'none'}} for tag in tags ]
-      if len(devices) == 1 and ngpux > 1:
-        devices = devices * ngpux
-      import TaskSystem
-      if TaskSystem.isMainProcess:  # On a child process, we can have the gpu device.
-        assert not TheanoFlags.get("device", "").startswith("gpu"), \
-            "The main proc is not supposed to use the GPU in multiprocessing mode. Do not set device=gpu in THEANO_FLAGS."
-    else:
-      devices = [ {"device": tags[0], "config": config, "blocking": True} ]
-    #if config.value("on_size_limit", "ignore") == "cpu" and devices[-1]["device"] != "cpu127":
-    #  devices.append({"device": "cpu127", "config": config})
-  return devices
 
 
 def is_using_gpu():
@@ -243,7 +97,7 @@ class Device(object):
     """
     :param str device: name, "gpu*" or "cpu*"
     :param Config.Config config: config
-    :param bool blocking: False -> multiprocessing, otherwise its blocking
+    :param bool blocking: False -> multiprocessing, otherwise it's blocking
     :param int num_batches: num batches to train on this device
     :param dict update_specs
     """
@@ -252,7 +106,7 @@ class Device(object):
     try:
       import pynvml
     except ImportError:
-      print("pynvml not available, memory information missing")
+      print("pynvml not available, memory information missing", file=log.v4)
     else:
       try:
         pynvml.nvmlInit()
@@ -272,6 +126,7 @@ class Device(object):
     self.num_frames = NumbersDict(0)
     self.num_updates = 0
     self.epoch = None
+    self.use_inputs = False
     if not update_specs: update_specs = {}
     update_specs.setdefault('update_rule', 'global')
     update_specs.setdefault('update_params', {})
@@ -409,16 +264,18 @@ class Device(object):
     update_specs.setdefault('layers', [])
     self.update_specs = update_specs
     self.block_size = update_specs['block_size']
+    self.seq_weights = {}
+    self.total_cost = 0
     target = config.value('target', 'classes')
     if self.blocking:
       assert os.getpid() == self.main_pid
     else:
-      assert os.getpid() != self.main_pid # this won't work on Windows
+      assert os.getpid() != self.main_pid  # this won't work on Windows
     import theano
     import theano.tensor as T
     import h5py
     self.T = T
-    self.seq_train_parallel_control = None  # type: SeqTrainParallelControlDevHost. will be set via SprintErrorSignals
+    self.seq_train_parallel_control = None  # type: SeqTrainParallelControlDevHost  # will be set via SprintErrorSignals
     self.network_task = config.value('task', 'train')
     eval_flag = self.network_task in ['eval', 'forward', 'daemon']
     testnet_kwargs = dict(mask="unity", train_flag=False, eval_flag=eval_flag)
@@ -525,9 +382,10 @@ class Device(object):
           if hasattr(ctx,member):
             output_streams[key].append(getattr(ctx,member))
           elif member in ctx.attrs:
-            output_streams[key].append(ctx.attrs['member'])
+            output_streams[key].append(ctx.attrs[member])
 
     self.forwarder = None
+    self.use_inputs = False
     if self.network_task in ['train', 'theano_graph']:
       if self.trainnet.loss in ('ctc', 'hmm'):
         train_givens = self.make_givens(self.trainnet)
@@ -547,9 +405,15 @@ class Device(object):
       elif self.update_specs['update_rule'] != 'none':
         self.updater = Updater.initRule(self.update_specs['update_rule'], **self.update_specs['update_params'])
 
-      self.train_outputs_format = ["cost:" + out for out in sorted(self.trainnet.costs.keys())]
+      outputs = []
+      self.train_outputs_format = []
+      if config.float('batch_pruning', 0):
+        outputs = [self.trainnet.output["output"].seq_weight]
+        self.train_outputs_format = ["weights"]
+
+      self.train_outputs_format += ["cost:" + out for out in sorted(self.trainnet.costs.keys())]
       # The function output lists must be consistent with TrainTaskThread.evaluate()
-      outputs = output_streams['train'] + [self.trainnet.costs[out] for out in sorted(self.trainnet.costs.keys())]
+      outputs += output_streams['train'] + [self.trainnet.costs[out] for out in sorted(self.trainnet.costs.keys())]
       if self.trainnet.ctc_priors is not None:
         self.train_outputs_format += ["ctc_priors"]
         outputs += [self.trainnet.ctc_priors]
@@ -669,7 +533,9 @@ class Device(object):
           #but makes the index handling with mdlstm work for now
           source.append(T.log(pcx))
         elif extract == "posteriors":
-          layer = self.testnet.get_layer(output_layer_name)
+          if not param:
+            param = output_layer_name
+          layer = self.testnet.get_layer(param)
           p_y_given_x = getattr(layer, "p_y_given_x", layer.output)
           index = layer.output_index()
           if p_y_given_x.ndim == 2:
@@ -796,11 +662,31 @@ class Device(object):
           source.append(self.testnet.x.reshape((self.testnet.i.shape[0], self.testnet.i.shape[1], self.testnet.x.shape[2])) * T.cast(self.testnet.i.dimshuffle(0,1,'x').repeat(self.testnet.x.shape[2],axis=2),'float32'))
         else:
           assert False, "invalid extraction: " + extract
-      self.extractor = theano.function(inputs = [],
-                                       outputs = source if len(source) == 1 else [T.concatenate(source, axis=-1)],
-                                       givens = givens,
-                                       on_unused_input=config.value('theano_on_unused_input', 'ignore'),
-                                       name = "extractor")
+      live_updates = [(p, p.live_update) for p in self.testnet.train_params_vars if p.live_update is not None]
+      if config.has('load_graph') or config.has('save_graph'):
+        self.use_inputs = True
+        if config.has('load_graph') and os.path.exists(config.value('load_graph', '')):
+          import dill
+          graphfile = config.value('load_graph', '')
+          print("Loading pre-compiled graph from '%s'" % graphfile, file=log.v4)
+          self.extractor = dill.load(open(graphfile, 'rb'))
+        else:
+          inp = [self.testnet.y[k] for k in self.used_data_keys]
+          inp += [self.testnet.j[k] for k in self.used_data_keys]
+          self.extractor = theano.function(inputs=inp,
+                                           outputs=source if len(source) == 1 else [T.concatenate(source, axis=-1)],
+                                           givens=[],
+                                           updates=live_updates,
+                                           on_unused_input=config.value('theano_on_unused_input', 'ignore'),
+                                           name="extractor")
+      else:
+        self.extractor = theano.function(inputs=[],
+                                         outputs=source if len(source) == 1 else [T.concatenate(source, axis=-1)],
+                                         givens=givens,
+                                         updates=live_updates,
+                                         on_unused_input=config.value('theano_on_unused_input', 'ignore'),
+                                         name="extractor")
+      self.save_graph = config.has('save_graph')
 
     elif self.network_task == 'classify':
       self.classifier = theano.function(inputs = [],
@@ -839,7 +725,19 @@ class Device(object):
           for j in range(len(block_output)):
             output[j] += block_output[j]
     elif task == "extract" or task == "forward":
-      output = self.extractor()
+      if self.use_inputs:
+        inp = [self.y[k].get_value() for k in self.used_data_keys]
+        inp += [self.j[k].get_value() for k in self.used_data_keys]
+        output = self.extractor(*inp)
+      else:
+        output = self.extractor()
+      if self.save_graph:
+        import dill
+        sys.setrecursionlimit(50000)
+        graphfile = self.config.value('save_graph','')
+        print("Saving pre-compiled graph to '%s'" % graphfile, file=log.v4)
+        dill.dump(self.extractor, open(graphfile, 'wb'))
+        self.save_graph = False
     elif task == 'classify':
       output = self.classifier()
     elif task == "analyze":
@@ -864,6 +762,11 @@ class Device(object):
       output = output[len(self.streams):]
       for stream, out in zip(self.streams, stream_outputs):
         stream.update(task, out, self.tags)
+
+    if outputs_format:
+      for fmt, out in zip(outputs_format, output):
+        if fmt.startswith('cost:'):
+          self.total_cost += out
 
     # In train, first output is the score.
     # If this is inf/nan, our model is probably broken.
@@ -967,13 +870,15 @@ class Device(object):
       # We do some minimal initialization, modelled after rnn.init().
       # This is needed because we are a new independent process. See startProc().
       import rnn
-      rnn.initBetterExchook()
+      rnn.init_better_exchook()
       rnn.config = config
-      rnn.initLog()
+      rnn.init_log()
       print("Device %s proc starting up, pid %i" % (device, os.getpid()), file=log.v3)
       print("Device %s proc: THEANO_FLAGS = %r" % (device, os.environ.get("THEANO_FLAGS", None)), file=log.v4)
-      rnn.initFaulthandler()
-      rnn.initConfigJsonNetwork()
+      rnn.init_faulthandler()
+      rnn.init_config_json_network()
+      import TheanoUtil
+      TheanoUtil.monkey_patches()
       self.process_inner(device, config, self.update_specs, asyncTask)
     except ProcConnectionDied as e:
       print("Device %s proc, pid %i: Parent seem to have died: %s" % (device, os.getpid(), e), file=log.v2)
@@ -1072,16 +977,17 @@ class Device(object):
         for k in target_keys:
           self.j[k].set_value(self.output_index[k].astype('int8'), borrow = True)
         try:
-          utf8_tags = [s.encode('utf-8') for s in self.tags]
-        except Exception:
-          utf8_tags = self.tags
-        self.tags_var.set_value(numpy.array(utf8_tags).view(dtype='int8').reshape((len(utf8_tags), max(map(len, utf8_tags)))))
+          self.tags_var.set_value(numpy.array(self.tags).view(dtype='int8').reshape((len(self.tags), max(map(len, self.tags)))))
+        except:
+          tags = [s.encode('utf-8') for s in self.tags]
+          self.tags_var.set_value(numpy.array(tags).view(dtype='int8').reshape((len(tags), max(map(len, tags)))))
         self.update_total_time += time.time() - update_start_time
       elif cmd == "set-learning-rate":  # via self.set_learning_rate()
         learning_rate = input_queue.recv()
         if self.updater:
           self.updater.setLearningRate(learning_rate)
       elif cmd == "set-net-params":  # via self.set_net_params()
+        self.total_cost = 0
         our_params_trainnet = self.trainnet.get_all_params_vars()
         our_params_testnet = self.testnet.get_all_params_vars()
         assert isinstance(our_params_trainnet, list)
@@ -1109,6 +1015,8 @@ class Device(object):
           output_queue.send(int(self.updater.i.get_value()))
         else:
           output_queue.send(0)
+      elif cmd == 'get-total-cost':
+        output_queue.send(self.total_cost)
       elif cmd == "get-net-train-params":  # via self.get_net_train_params()
         output_queue.send("net-train-params")
         output_queue.send(len(network_params))
@@ -1129,7 +1037,7 @@ class Device(object):
           sys.excepthook(*sys.exc_info())
           # If there are any other than the main thread.
           # Actually, that would be unexpected.
-          Debug.dumpAllThreadTracebacks()
+          Debug.dump_all_thread_tracebacks()
           return
         except MemoryError:
           output_queue.send("error")
@@ -1297,6 +1205,14 @@ class Device(object):
       assert self.main_pid == os.getpid()
       self.input_queue.send("get-num-updates")
       return int(self.output_queue.recv())
+
+  def get_total_cost(self):
+    if self.blocking:
+      return self.total_cost
+    else:
+      assert self.main_pid == os.getpid()
+      self.input_queue.send("get-total-cost")
+      return float(self.output_queue.recv())
 
   def start_epoch_stats(self):
     if not self.is_device_proc():

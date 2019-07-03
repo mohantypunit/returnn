@@ -47,6 +47,7 @@ GeForce GTX 680:
     CPU:BasicLSTM: 0:03:58.1545
 """
 
+from __future__ import print_function
 import sys
 import os
 import time
@@ -58,7 +59,7 @@ sys.path += [os.path.dirname(os.path.dirname(os.path.abspath(__file__)))]
 import better_exchook
 from Log import log
 from Config import Config
-from Util import hms_fraction, describe_crnn_version, describe_tensorflow_version
+from Util import hms_fraction, describe_returnn_version, describe_tensorflow_version
 from TFEngine import Engine
 from TFUtil import setup_tf_thread_pools, is_gpu_available, print_available_devices
 from Dataset import init_dataset, Dataset
@@ -67,7 +68,7 @@ from Dataset import init_dataset, Dataset
 LstmCellTypes = [
   "BasicLSTM", "StandardLSTM",
   "LSTMBlock", "LSTMBlockFused",
-  "NativeLSTM",
+  "NativeLSTM", "NativeLstm2", "NativeLstmLowMem",
   "CudnnLSTM"
 ]
 
@@ -100,7 +101,7 @@ def make_config_dict(lstm_unit, use_gpu):
   for i in range(num_layers):
     for direction in [-1, 1]:
       dir_str = {-1: "bwd", 1: "fwd"}[direction]
-      layer = {"class": "rec", "unit": lstm_unit, "n_out": base_settings["n_hidden"]}
+      layer = {"class": "rec", "unit": lstm_unit, "n_out": base_settings["n_hidden"], "direction": direction}
       if i > 0:
         layer["from"] = ["lstm%i_fwd" % i, "lstm%i_bwd" % i]
       network["lstm%i_%s" % (i + 1, dir_str)] = layer
@@ -115,6 +116,7 @@ def make_config_dict(lstm_unit, use_gpu):
     "num_epochs": 1,
     "model": None,  # don't save
     "tf_log_dir": None,  # no TF logs
+    "tf_log_memory_usage": True,
     "network": network,
     # batching
     "batch_size": base_settings["batch_size"],
@@ -172,7 +174,7 @@ def main():
   pprint(base_settings)
 
   log.initialize(verbosity=[4])
-  print("Returnn:", describe_crnn_version(), file=log.v3)
+  print("Returnn:", describe_returnn_version(), file=log.v3)
   print("TensorFlow:", describe_tensorflow_version(), file=log.v3)
   print("Python:", sys.version.replace("\n", ""), sys.platform)
   if not args.no_setup_tf_thread_pools:

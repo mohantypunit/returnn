@@ -1,4 +1,7 @@
-#! /usr/bin/python2.7
+
+"""
+This defines the base dataset class :class:`Dataset`.
+"""
 
 from __future__ import print_function
 
@@ -16,14 +19,18 @@ from random import Random, random
 import sys
 import os
 import numpy
-import theano
+import functools
+import typing
 
 from Log import log
 from EngineBatch import Batch, BatchSetGenerator
-from Util import try_run, NumbersDict, unicode
+from Util import try_run, NumbersDict, unicode, OptionalNotImplementedError
 
 
 class Dataset(object):
+  """
+  Base class for any dataset. This defines the dataset API.
+  """
 
   @staticmethod
   def kwargs_update_from_config(config, kwargs):
@@ -32,15 +39,21 @@ class Dataset(object):
     :type kwargs: dict[str]
     """
     def set_or_remove(key, value):
+      """
+      :param str key:
+      :param value:
+      """
       if key in kwargs and kwargs[key] is None:
         del kwargs[key]
       if value is not None and key not in kwargs:
         kwargs[key] = value
+
     set_or_remove("window", config.int('window', 0) or None)
     set_or_remove("context_window", config.typed_value("context_window"))
-    set_or_remove("chunking", config.value("chunking", None))
+    set_or_remove("chunking", config.opt_typed_value("chunking", None))
     set_or_remove("seq_ordering", config.value("batching", None))
     set_or_remove("shuffle_frames_of_nseqs", config.int('shuffle_frames_of_nseqs', 0) or None)
+    set_or_remove("min_chunk_size", config.int('min_chunk_size', 0) or None)
 
   @classmethod
   def from_config(cls, config, **kwargs):
@@ -52,42 +65,70 @@ class Dataset(object):
     cls.kwargs_update_from_config(config, kwargs)
     return cls(**kwargs)
 
-  def __init__(self, name="dataset",
-               window=1, context_window=None, chunking="0",
-               seq_ordering='default', shuffle_frames_of_nseqs=0,
+  def __init__(self, name=None,
+               window=1, context_window=None, chunking=None,
+               seq_ordering='default', partition_epoch=None, repeat_epoch=None,
+               shuffle_frames_of_nseqs=0, min_chunk_size=0,
                estimated_num_seqs=None,):
     """
     :param str name: e.g. "train" or "eval"
     :param int window: features will be of dimension window * feature_dim, as we add a context-window around.
       not all datasets support this option.
     :param None|int|dict|NumbersDict context_window: will add this context for each chunk
-    :param str chunking: "chunk_size:chunk_step"
+    :param None|str|int|(int,int)|dict|(dict,dict) chunking: "chunk_size:chunk_step"
     :param str seq_ordering: "batching"-option in config. e.g. "default", "sorted" or "random".
       See self.get_seq_order_for_epoch() for more details.
+    :param int|None partition_epoch:
+    :param int|None repeat_epoch: Repeat the sequences in an epoch this many times. Useful to scale the dataset
+      relative to other datasets, e.g. when used in CombinedDataset. Not allowed to be used in combination with
+      partition_epoch.
     :param int shuffle_frames_of_nseqs: shuffles the frames. not always supported
     :param None|int estimated_num_seqs: for progress reporting in case the real num_seqs is unknown
     """
-    self.name = name
+    self.name = name or ("dataset_id%s" % id(self))
     self.lock = RLock()  # Used when manipulating our data potentially from multiple threads.
-    self.num_inputs = 0
-    self.num_outputs = None; " :type: dict[str,(int,int)] "  # tuple is num-classes, len(shape).
+    self.rnd_seq_drop = None  # type: typing.Optional[Random]
+    self.num_inputs = 0  # usually not used, but num_outputs instead, which is more generic
+    self.num_outputs = None  # type: typing.Optional[typing.Dict[str,typing.Tuple[int,int]]]  # tuple is num-classes, len(shape).  # nopep8
     self.window = window
     self.seq_ordering = seq_ordering  # "default", "sorted" or "random". See self.get_seq_order_for_epoch().
-    self.timestamps = []
-    self.labels = {}; """ :type: dict[str,list[str]] """
+    self.partition_epoch = partition_epoch or 1
+    self.repeat_epoch = repeat_epoch or 1
+    # There is probably no use case for combining the two, so avoid potential misconfiguration.
+    assert self.partition_epoch == 1 or self.repeat_epoch == 1, (
+      "Combining partition_epoch and repeat_epoch is prohibited.")
+    self.timestamps = None
+    self.labels = {}  # type: typing.Dict[str,typing.List[str]]
+    self.weights = {}
     self.nbytes = 0
     self.num_running_chars = 0  # CTC running chars.
     self._num_timesteps = 0
-    self._num_codesteps = None; " :type: int "  # Num output frames, could be different from input, seq2seq, ctc.
+    self._num_codesteps = None  # type: typing.Optional[int]  # Num output frames, could be different from input, seq2seq, ctc.  # nopep8
     self._num_seqs = 0
     self._estimated_num_seqs = estimated_num_seqs
-    self.chunk_size = int(chunking.split(':')[0])
-    if ':' in chunking:
-      self.chunk_step = int(chunking.split(':')[1])
-      assert self.chunk_step > 0, "chunking step must be positive"
-    else:
-      self.chunk_step = self.chunk_size
-    assert self.chunk_size >= 0, "chunk size must not be negative"
+    self.min_chunk_size = min_chunk_size
+    if isinstance(chunking, str):
+      if ":" in chunking:
+        chunking = tuple(map(int, chunking.split(":")))
+      else:
+        chunking = int(chunking)
+    if not isinstance(chunking, (tuple, list)):
+      chunking = (chunking, None)
+    chunk_size, chunk_step = chunking
+    if chunk_size is None:
+      chunk_size = 0
+    assert isinstance(chunk_size, (int, dict, NumbersDict))
+    chunk_size = NumbersDict(chunk_size)
+    assert chunk_size == 0 or chunk_size.min_value() > 0, "chunk size must not be negative"
+    self.chunk_size = chunk_size
+    if chunk_step in (None, 0):
+      chunk_step = self.chunk_size
+    assert isinstance(chunk_step, (int, dict, NumbersDict))
+    chunk_step = NumbersDict(chunk_step)
+    if self.chunk_size != 0:
+      assert sorted(chunk_step.keys()) == sorted(chunk_size.keys())
+      assert chunk_step.max_value() > 0, "chunking step must be positive (for some key)"
+    self.chunk_step = chunk_step
     if context_window is None:
       context_window = NumbersDict(0)
     elif isinstance(context_window, int):
@@ -100,13 +141,17 @@ class Dataset(object):
     self.epoch = None
 
   def __repr__(self):
-    return "<%s %r>" % (self.__class__.__name__, self.name)
+    return "<%s %r epoch=%s>" % (
+      self.__class__.__name__,
+      getattr(self, "name", "<unknown>"),
+      getattr(self, "epoch", "<unknown>"))
 
   def sliding_window(self, xr):
     """
     :type xr: numpy.ndarray
     :rtype: numpy.ndarray
     """
+    # noinspection PyProtectedMember
     from numpy.lib.stride_tricks import as_strided
     x = numpy.concatenate([self.zpad, xr, self.zpad])
     return as_strided(
@@ -115,6 +160,7 @@ class Dataset(object):
       strides=(x.strides[0], x.strides[1] * self.num_inputs) + x.strides
       ).reshape((xr.shape[0], self.num_inputs * self.window))
 
+  # noinspection PyMethodMayBeStatic
   def preprocess(self, seq):
     """
     :type seq: numpy.ndarray
@@ -142,28 +188,39 @@ class Dataset(object):
     For multiple target seqs, it is expected that they all have the same len.
     We support different input/target len for seq2seq/ctc and other models.
     Note: This is deprecated, better use get_seq_length().
+    Attention: Either this method or get_seq_length() needs to be redefined
+    in any subclass of Dataset! However, in new code, just override get_seq_length().
     """
-    l = self.get_seq_length(sorted_seq_idx)
+    ls = self.get_seq_length(sorted_seq_idx)
     targets = self.get_target_list()
     if targets:
-      return numpy.array([l["data"], l[targets[0]]])
+      return numpy.array([ls["data"], ls[targets[0]]])
     else:
-      return numpy.array([l["data"], 0])
+      return numpy.array([ls["data"], 0])
 
   def get_seq_length(self, seq_idx):
     """
+    :param int seq_idx:
     :rtype: NumbersDict
+    :returns the len of the input features and the len of the target sequence.
     """
+    assert self.__class__.get_seq_length_2d is not Dataset.get_seq_length_2d, "Override get_seq_length."
     input_len, output_len = self.get_seq_length_2d(seq_idx)
     d = {"data": input_len}
     d.update({k: output_len for k in self.get_target_list()})
     return NumbersDict(d)
 
   def get_num_timesteps(self):
+    """
+    :rtype: int
+    """
     assert self._num_timesteps > 0
     return self._num_timesteps
 
   def get_num_codesteps(self):
+    """
+    :rtype: int|list[int]
+    """
     if self._num_codesteps is None:
       return [self.get_num_timesteps()]
     return self._num_codesteps
@@ -171,12 +228,14 @@ class Dataset(object):
   def load_seqs(self, start, end):
     """
     Load data sequences, such that self.get_data() & friends can return the data.
+
     :param int start: start sorted seq idx, inclusive
     :param int end: end sorted seq idx, exclusive
     """
     assert start >= 0
     assert start <= end
-    if self.is_cached(start, end): return
+    if self.is_cached(start, end):
+      return
 
     if self.shuffle_frames_of_nseqs > 0:
       # We always load N seqs at once and shuffle all their frames.
@@ -206,7 +265,7 @@ class Dataset(object):
     return start, end
 
   def _shuffle_frames_in_seqs(self, start, end):
-    raise NotImplementedError
+    raise OptionalNotImplementedError
 
   def _load_seqs(self, start, end):
     """
@@ -229,39 +288,95 @@ class Dataset(object):
     :return: the order for the given epoch. such that seq_idx -> underlying idx
     :rtype: list[int]
     """
+    partition_epoch = self.partition_epoch or 1
+    repeat_epoch = self.repeat_epoch or 1
+    if not epoch:
+      epoch = 1
+    full_epoch = epoch
+    if partition_epoch > 1:
+      full_epoch = (epoch - 1) // partition_epoch + 1
     assert num_seqs > 0
-    seq_index = list(range(num_seqs)); """ :type: list[int]. the real seq idx after sorting """
+    seq_index = list(range(num_seqs))  # type: typing.List[int]  # the real seq idx after sorting
     if self.seq_ordering == 'default':
       pass  # Keep order as-is.
+    elif self.seq_ordering.startswith("default_every_n:"):
+      # This order is useful if you have "initial_state": "keep_over_epoch",
+      # where num == max_seqs, batch_size = inf, max_seq_len = inf, chunking = None.
+      _, num = self.seq_ordering.split(":")
+      num = int(num)
+      seq_index = numpy.arange(num_seqs // num, dtype="int64").repeat(num)
+      for i in range(1, num):
+        seq_index[i::num] += i * (num_seqs // num)
+      seq_index = list(seq_index)
+    elif self.seq_ordering == 'reverse':
+      seq_index = list(reversed(seq_index))
     elif self.seq_ordering == 'sorted':
       assert get_seq_len
-      seq_index.sort(key=get_seq_len)  # sort by length
+      seq_index.sort(key=get_seq_len)  # sort by length, starting with shortest
+    elif self.seq_ordering == "sorted_reverse":
+      assert get_seq_len
+      seq_index.sort(key=get_seq_len, reverse=True)  # sort by length, in reverse, starting with longest
     elif self.seq_ordering.startswith('laplace'):
       assert get_seq_len
-      tmp = self.seq_ordering.split(':')
-      bins = int(tmp[1]) if len(tmp) > 1 else 2
-      nth = int(tmp[2]) if len(tmp) > 2 else 1
-      rnd_seed = ((epoch - 1) // nth + 1) if epoch else 1
+      tmp = self.seq_ordering.split(':')[1:]
+      if len(tmp) == 0:
+        bins = 2
+      else:
+        if tmp[0].startswith("."):  # starting with "." -> approx chunk size (num of seqs in one bin)
+          bins = max(num_seqs // int(tmp[0][1:]), 2)
+        else:  # the number of bins
+          bins = int(tmp[0])
+      if len(tmp) <= 1:
+        nth = 1
+      else:
+        nth = int(tmp[1])
+      rnd_seed = ((full_epoch - 1) // nth + 1) if full_epoch else 1
       rnd = Random(rnd_seed)
       rnd.shuffle(seq_index)
       out_index = []
       for i in range(bins):
         if i == bins - 1:
-          part = seq_index[i * len(seq_index) // bins:]
+          part = seq_index[i * len(seq_index) // bins:][:]
         else:
-          part = seq_index[i * len(seq_index) // bins:(i + 1) * len(seq_index) // bins]
-        part.sort(key=get_seq_len, reverse=(i%2 == 1))
+          part = seq_index[i * len(seq_index) // bins:(i + 1) * len(seq_index) // bins][:]
+        part.sort(key=get_seq_len, reverse=(i % 2 == 1))
         out_index += part
       seq_index = out_index
     elif self.seq_ordering.startswith('random'):
       tmp = self.seq_ordering.split(':')
       nth = int(tmp[1]) if len(tmp) > 1 else 1
       # Keep this deterministic! Use fixed seed.
-      rnd_seed = ((epoch-1) / nth + 1) if epoch else 1
+      rnd_seed = (full_epoch - 1) / nth + 1
       rnd = Random(rnd_seed)
       rnd.shuffle(seq_index)
     else:
       assert False, "invalid batching specified: " + self.seq_ordering
+    if partition_epoch > 1:
+      seq_index = self._apply_partition_epoch(seq_index, partition_epoch, epoch)
+    if repeat_epoch > 1:
+      seq_index = seq_index * repeat_epoch
+    return seq_index
+
+  @classmethod
+  def _apply_partition_epoch(cls, seq_index, partition_epoch, epoch):
+    """
+    :param list[int] seq_index: full list of ordered sequence indices
+    :param int partition_epoch: number of partitions seq_index should be split into
+    :param int|None epoch: current epoch
+    :return: partition of seq_index for current epoch
+    :rtype: list[int]
+    """
+    num_seqs = len(seq_index)
+    current_partition = ((epoch or 1) - 1) % partition_epoch
+    seqs_per_epoch = num_seqs // partition_epoch
+    partition_sizes = ([seqs_per_epoch + 1] * (num_seqs % partition_epoch) +
+                       [seqs_per_epoch] * (partition_epoch - num_seqs % partition_epoch))
+    assert sum(partition_sizes) == num_seqs and len(partition_sizes) == partition_epoch
+    partitions = functools.reduce(lambda a, x: a + [a[-1] + x], partition_sizes, [0])  # cumulative sum
+    assert len(partitions) == partition_epoch + 1
+    seq_index = seq_index[partitions[current_partition]:partitions[current_partition + 1]]
+    assert len(seq_index) == partition_sizes[current_partition]
+
     return seq_index
 
   def init_seq_order(self, epoch=None, seq_list=None):
@@ -278,19 +393,33 @@ class Dataset(object):
     self.rnd_seq_drop = Random(epoch or 1)
     return False
 
+  def get_current_seq_order(self):
+    """
+    :return: many datasets use self.get_seq_order_for_epoch. this function would return the current seq order
+      for the current epoch, after self.init_seq_order was called.
+      Not all datasets implement this.
+    :rtype: list[int]
+    """
+    raise OptionalNotImplementedError
+
   def _base_init(self):
+    self.nbytes = 0
+    self.zpad = None
     # We expect that the following attributes are already set elsewhere, by a derived class.
-    assert self.num_inputs > 0
     assert self.num_outputs
+    if not self.num_inputs:
+      assert not self.window or self.window in (0, 1) or "data" in self.num_outputs
+      return
+    assert self.num_inputs > 0
     assert self.window > 0
 
     if int(self.window) % 2 == 0:
       self.window += 1
 
-    self.nbytes = numpy.array([], dtype=theano.config.floatX).itemsize * (self.num_inputs * self.window + 1 + 1)
+    self.nbytes = numpy.array([], dtype=numpy.float32).itemsize * (self.num_inputs * self.window + 1 + 1)
 
     if self.window > 1:
-      self.zpad = numpy.zeros((int(self.window) // 2, self.num_inputs), dtype=theano.config.floatX)
+      self.zpad = numpy.zeros((int(self.window) // 2, self.num_inputs), dtype=numpy.float32)
 
   def initialize(self):
     """
@@ -301,7 +430,10 @@ class Dataset(object):
     self.init_seq_order()
 
   def get_times(self, sorted_seq_idx):
-    raise NotImplementedError
+    """
+    :param int sorted_seq_idx:
+    """
+    raise OptionalNotImplementedError
 
   def get_data(self, seq_idx, key):
     """
@@ -326,6 +458,7 @@ class Dataset(object):
 
   def get_targets(self, target, sorted_seq_idx):
     """
+    :param str target: data key
     :type sorted_seq_idx: int
     :rtype: numpy.ndarray
     :returns targets: format 1d (time) (int: idx of output-feature)
@@ -334,9 +467,23 @@ class Dataset(object):
     return self.get_data(sorted_seq_idx, target)
 
   def get_ctc_targets(self, sorted_seq_idx):
-    raise NotImplementedError
+    """
+    Warning: This is deprecated/obsolete.
+
+    :param int sorted_seq_idx:
+    :rtype: numpy.ndarray|None
+    """
+    return None
 
   def get_data_slice(self, seq_idx, key, start_frame, end_frame):
+    """
+    :param int seq_idx:
+    :param str key:
+    :param int start_frame:
+    :param int end_frame:
+    :return: x[start_frame:end_frame], with x = get_data(seq_idx, key)
+    :rtype: numpy.ndarray
+    """
     if "[sparse:" in key and (start_frame > 0 or end_frame < self.get_seq_length(seq_idx)[key]):
       return self._get_data_slice_sparse(seq_idx, key, start_frame, end_frame)
     data = self.get_data(seq_idx, key)
@@ -359,12 +506,70 @@ class Dataset(object):
       return data[s0_start:s0_end]
 
   def get_tag(self, sorted_seq_idx):
+    """
+    :param int sorted_seq_idx:
+    :rtype: str
+    """
     return "seq-%i" % sorted_seq_idx
 
-  def has_ctc_targets(self):
+  def get_all_tags(self):
+    """
+    :return: list of all seq tags, of the whole dataset, without partition epoch.
+      Note that this is not possible with all datasets.
+    :rtype: list[str]
+    """
+    old_partition_epoch = self.partition_epoch
+    try:
+      all_tags = [None] * self.num_seqs  # type: typing.List[typing.Union[None,str]]
+      for seq_idx in range(self.num_seqs):
+        all_tags[seq_idx] = self.get_tag(seq_idx)
+      return all_tags
+    finally:
+      self.partition_epoch = old_partition_epoch
+
+  def get_total_num_seqs(self):
+    """
+    :return: total number of seqs, without partition epoch.
+      Should be the same as len(self.get_all_tags()).
+      Note that this is not possible with all datasets.
+    :rtype: int
+    """
+    if self.partition_epoch == 1:
+      # Note: self.num_seqs might not always be set, or even be correct...
+      return self.num_seqs
+    raise NotImplementedError("%s: get_total_num_seqs with partition epoch %i" % (self, self.partition_epoch))
+
+  def have_corpus_seq_idx(self):
+    """
+    :rtype: bool
+    :return: whether you can call self.get_corpus_seq_idx()
+    """
     return False
 
+  def get_corpus_seq_idx(self, seq_idx):
+    """
+    :param int seq_idx: sorted sequence index from the current epoch, depending on seq_ordering
+    :return: the sequence index as-is in the original corpus (as if you would have sorting="default").
+      only defined if self.have_corpus_seq_idx()
+    :rtype: int
+    """
+    if self.seq_ordering == "default":
+      return seq_idx
+    assert self.have_corpus_seq_idx()
+    raise NotImplemented
+
+  def has_ctc_targets(self):
+    """
+    :return: whether we have get_ctc_targets implemented
+    :rtype: bool
+    """
+    return False
+
+  # noinspection PyMethodMayBeStatic
   def get_max_ctc_length(self):
+    """
+    :rtype: int
+    """
     return 0
 
   @classmethod
@@ -386,13 +591,17 @@ class Dataset(object):
 
   def get_complete_frac(self, seq_idx):
     """
+    :param int seq_idx:
     :return: Returns a fraction (float in [0,1], always > 0) of how far we have advanced
       for this seq in the dataset.
       This does not have to be exact. This is only for the user.
+    :rtype: float
     """
+    # noinspection PyBroadException
     try:
       num_seqs = self.num_seqs
     except Exception:  # num_seqs not always available
+      # noinspection PyBroadException
       try:
         num_seqs = self.estimated_num_seqs
       except Exception:  # also not always available
@@ -401,10 +610,18 @@ class Dataset(object):
 
   @property
   def num_seqs(self):
+    """
+    :rtype: int
+    """
     raise NotImplementedError
 
   @property
   def estimated_num_seqs(self):
+    """
+    :return: estimated num seqs. does not have to be exact
+    :rtype: int|None
+    """
+    # noinspection PyBroadException
     try:
       return self.num_seqs
     except Exception:  # might not be available
@@ -414,9 +631,17 @@ class Dataset(object):
     return None
 
   def get_data_keys(self):
+    """
+    :return: all available data keys (for get_data and all other functions)
+    :rtype: list[str]
+    """
     return ["data"] + self.get_target_list()
 
   def get_target_list(self):
+    """
+    :return: subset of :func:`get_data_keys`. target keys are usually not available during inference
+    :rtype: list[str]
+    """
     return ["classes"]
 
   def get_data_dim(self, key):
@@ -425,10 +650,12 @@ class Dataset(object):
     :return: number of classes, no matter if sparse or not
     :rtype: int
     """
-    if key == "data":
-      return self.num_inputs * self.window
     if key in self.num_outputs:
+      # num_outputs should have the correct dimension, even for key "data" with self.window > 1.
       return self.num_outputs[key][0]
+    if self.window > 1 and key == "data":
+      assert self.num_inputs
+      return self.num_inputs * self.window
     return 1  # unknown
 
   def get_data_dtype(self, key):
@@ -447,8 +674,9 @@ class Dataset(object):
     :return: whether the data is sparse
     :rtype: bool
     """
+    # Note: We cannot call get_data_dtype, as we would maybe result in infinite recursion.
     if key in self.num_outputs:
-      return self.num_outputs[key][1] == 1
+      return self.num_outputs[key][1] <= 1
     if key == "data":
       return False
     return True
@@ -458,6 +686,13 @@ class Dataset(object):
     :returns get_data(*, key).shape[1:], i.e. num-frames excluded
     :rtype: list[int]
     """
+    if key in self.num_outputs:
+      if self.num_outputs[key][1] <= 1:
+        return []
+      res_shape = [None] * (self.num_outputs[key][1] - 1)  # type: typing.List[typing.Union[None,int]]
+      if not self.is_data_sparse(key):
+        res_shape[-1] = self.get_data_dim(key)
+      return res_shape
     if self.is_data_sparse(key):
       return []
     return [self.get_data_dim(key)]
@@ -505,20 +740,24 @@ class Dataset(object):
     return " ".join(map(self.labels[key].__getitem__, data))
 
   def calculate_priori(self, target="classes"):
-    priori = numpy.zeros((self.num_outputs[target][0],), dtype=theano.config.floatX)
+    """
+    :param str target:
+    :rtype: numpy.ndarray
+    """
+    priori = numpy.zeros((self.num_outputs[target][0],), dtype=numpy.float32)
     i = 0
     while self.is_less_than_num_seqs(i):
       self.load_seqs(i, i + 1)
       for t in self.get_targets(target, i):
         priori[t] += 1
       i += 1
-    return numpy.array(priori / self.get_num_timesteps(), dtype=theano.config.floatX)
+    return numpy.array(priori / self.get_num_timesteps(), dtype=numpy.float32)
 
   def iterate_seqs(self, chunk_size=None, chunk_step=None, used_data_keys=None):
     """
     Takes chunking into consideration.
-    :param int chunk_size:
-    :param int chunk_step:
+    :param int|NumbersDict chunk_size:
+    :param int|NumbersDict chunk_step:
     :param set(str)|None used_data_keys:
     :return: generator which yields tuples (seq index, seq start, seq end)
     :rtype: list[(int,NumbersDict,NumbersDict)]
@@ -527,29 +766,44 @@ class Dataset(object):
       chunk_size = self.chunk_size
     if chunk_step is None:
       chunk_step = self.chunk_step
+    chunk_size = NumbersDict(chunk_size)
+    chunk_step = NumbersDict(chunk_step)
     s = 0
     while self.is_less_than_num_seqs(s):
       length = self.get_seq_length(s)
       if chunk_size == 0:
-        yield (s, length.constant_like(0), length)
+        yield (s, NumbersDict.constant_like(0, numbers_dict=length), length)
       else:
+        default_key = "data"
         if used_data_keys is not None:
           length = NumbersDict({k: length[k] for k in used_data_keys})
-        t = length.constant_like(0)
-        default_key = "data"
+          if default_key not in used_data_keys:
+            default_key = sorted(used_data_keys)[0]
+          if chunk_step[default_key] == 0:  # allow some keys with zero chunk-step
+            assert chunk_step.max_value() > 0
+            default_key = [key for key in sorted(used_data_keys) if chunk_step[key] > 0][0]
+        assert chunk_step[default_key] > 0
+        t = NumbersDict.constant_like(0, numbers_dict=length)
         # There are usually the 'data' (input) and 'classes' (targets) data-keys in `length` but there can be others.
         # We expect them all of the same length so that we can do chunking.
         # In case that some length is 0 or 1,
         # we treat it special and always return the full seq repeated for every chunk.
         keys_with_full_seqs = []
         for key in length.keys():
-          if length[key] == length[default_key]:
-            continue  # ok
-          if length[key] <= 1:
+          if chunk_step[key] == chunk_step[default_key]:
+            if length[key] == length[default_key]:
+              continue  # ok
+          if length[key] <= 1:  # special case as explained above
             keys_with_full_seqs.append(key)
             continue
-          raise Exception("Chunking with multiple data-keys of different length: %r" % length)
-        while t[default_key] < length[default_key]:
+          if chunk_step[key] == chunk_step[default_key]:
+            raise Exception("Chunking with multiple data-keys of different length: %r" % length)
+          else:
+            nr_of_full_chunks_key = (length[key] - chunk_size[key]) // chunk_step[key] + 1
+            nr_of_full_chunks_default_key = (
+              (length[default_key] - chunk_size[default_key]) // chunk_step[default_key] + 1)
+            assert nr_of_full_chunks_key == nr_of_full_chunks_default_key
+        while length[default_key] > t[default_key]:
           chunk_start = NumbersDict(t)
           chunk_end = NumbersDict.min([t + chunk_size, length])
           for key in keys_with_full_seqs:
@@ -560,6 +814,8 @@ class Dataset(object):
             chunk_end.value = None
           yield (s, chunk_start, chunk_end)
           t += chunk_step
+          if length[default_key] - t[default_key] <= self.min_chunk_size:
+            break
       s += 1
 
   def _get_context_window_left_right(self):
@@ -587,65 +843,116 @@ class Dataset(object):
     :rtype: (NumbersDict,NumbersDict)
     """
     end = self.get_seq_length(seq_idx)
-    start = end.constant_like(0)
+    start = NumbersDict.constant_like(0, numbers_dict=end)
     ctx_lr = self._get_context_window_left_right()
     if ctx_lr:
       start -= ctx_lr[0]
       end += ctx_lr[1]
     return start, end
 
-  def _generate_batches(self, recurrent_net, batch_size, max_seqs=-1, seq_drop=0.0, max_seq_length=sys.maxsize, used_data_keys=None):
+  def sample(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: bool
+    """
+    if seq_idx in self.weights:
+      weight = self.weights[seq_idx]
+      return weight[0] >= weight[1]
+    return True
+
+  def update_weights(self, seqs, weights):
+    """
+    :param list[EngineBatch.BatchSeqCopyPart] seqs:
+    :param list[float] weights:
+    """
+    for seq, weight in zip(seqs, weights):
+      self.weights[seq.seq_idx] = [weight, 0]
+
+  def _generate_batches(self, recurrent_net,
+                        batch_size, max_seqs=-1, max_seq_length=sys.maxsize,
+                        min_seq_length=0, pruning=0.0,
+                        seq_drop=0.0, max_total_num_seqs=-1,
+                        used_data_keys=None):
     """
     :param bool recurrent_net: If True, the batch might have a batch seq dimension > 1.
       Otherwise, the batch seq dimension is always 1 and multiple seqs will be concatenated.
-    :param int batch_size: Max number of frames in one batch.
+    :param int|dict[str,int]|NumbersDict batch_size: Max number of frames in one batch.
     :param int max_seqs: Max number of seqs per batch.
+    :param int max_total_num_seqs:
+    :param int|dict[str,int]|NumbersDict max_seq_length:
     :param set(str)|None used_data_keys:
     """
-    if batch_size == 0: batch_size = sys.maxsize
-    assert batch_size > 0
-    if max_seqs == -1: max_seqs = float('inf')
+    if not batch_size:
+      batch_size = sys.maxsize
+    batch_size = NumbersDict(batch_size)
+    assert not batch_size.any_compare(NumbersDict(0), (lambda a, b: a <= b))
+    if max_seqs == -1:
+      max_seqs = float('inf')
+    if not max_seq_length:
+      max_seq_length = sys.maxsize
+    if isinstance(max_seq_length, int) and max_seq_length < 0:
+      max_seq_length = {"classes": -max_seq_length}
+    max_seq_length = NumbersDict(max_seq_length)
+    min_seq_length = NumbersDict(min_seq_length)
     assert max_seqs > 0
     assert seq_drop <= 1.0
+    if not max_total_num_seqs or max_total_num_seqs < 0:
+      max_total_num_seqs = float("inf")
     chunk_size = self.chunk_size
     chunk_step = self.chunk_step
     if not recurrent_net:
       if chunk_size != 0:
-        print("Non-recurrent network, chunk size %i:%i ignored" % (chunk_size, chunk_step), file=log.v4)
+        print("Non-recurrent network, chunk size %s:%s ignored" % (chunk_size, chunk_step), file=log.v4)
         chunk_size = 0
     batch = Batch()
     ctx_lr = self._get_context_window_left_right()
-    for seq_idx, t_start, t_end in self.iterate_seqs(chunk_size=chunk_size, chunk_step=chunk_step, used_data_keys=used_data_keys):
+    total_num_seqs = 0
+    last_seq_idx = -1
+    avg_weight = sum([v[0] for v in self.weights.values()]) / (len(self.weights.keys()) or 1)
+    for idx in self.weights:
+      self.weights[idx][1] = random() * avg_weight * pruning
+      self.weights[idx][0] *= (1. + pruning)
+    for seq_idx, t_start, t_end in self.iterate_seqs(
+          chunk_size=chunk_size, chunk_step=chunk_step, used_data_keys=used_data_keys):
+      if not self.sample(seq_idx):
+        continue
+      if total_num_seqs > max_total_num_seqs:
+        break
       if ctx_lr:
         t_start -= ctx_lr[0]
         t_end += ctx_lr[1]
       if recurrent_net:
         length = t_end - t_start
-        if max_seq_length < 0 and length['classes'] > -max_seq_length:
+        if length.any_compare(max_seq_length, (lambda a, b: a > b)):
           continue
-        elif max_seq_length > 0 and length.max_value() > max_seq_length:
+        if length.any_compare(min_seq_length, (lambda a, b: a < b)):
           continue
-        if length.max_value() > batch_size:
-          print("warning: sequence length (%i) larger than limit (%i)" % (length.max_value(), batch_size), file=log.v4)
+        if length.any_compare(batch_size, (lambda a, b: a > b)):
+          print("warning: sequence length (%r) larger than limit (%r)" % (length, batch_size), file=log.v4)
         if self.rnd_seq_drop.random() < seq_drop:
           continue
         dt, ds = batch.try_sequence_as_slice(length)
-        if ds > 1 and ((dt * ds).max_value() > batch_size or ds > max_seqs):
+        if ds > 1 and ((dt * ds).any_compare(batch_size, (lambda a, b: a > b)) or ds > max_seqs):
           yield batch
           batch = Batch()
         batch.add_sequence_as_slice(seq_idx=seq_idx, seq_start_frame=t_start, length=length)
       else:  # Not recurrent.
         while t_start.max_value() < t_end.max_value():
           length = t_end - t_start
-          num_frames = NumbersDict.min([length, batch_size - batch.get_all_slices_num_frames()])
+          num_frames = NumbersDict.min(
+            [length, batch_size.copy_like(length) - batch.get_all_slices_num_frames().copy_like(length)])
           assert num_frames.max_value() > 0
           batch.add_frames(seq_idx=seq_idx, seq_start_frame=t_start, length=num_frames)
-          if batch.get_all_slices_num_frames() >= batch_size or batch.get_num_seqs() > max_seqs:
+          if (batch.get_all_slices_num_frames().any_compare(batch_size, (lambda a, b: a >= b))
+                  or batch.get_num_seqs() > max_seqs):
             yield batch
             batch = Batch()
           t_start += num_frames
+      if seq_idx != last_seq_idx:
+        last_seq_idx = seq_idx
+        total_num_seqs += 1
 
-    if batch.get_all_slices_num_frames() > 0:
+    if batch.get_all_slices_num_frames().max_value() > 0:
       yield batch
 
   def batch_set_generator_cache_whole_epoch(self):
@@ -663,64 +970,62 @@ class Dataset(object):
     """
     return False
 
-  def generate_batches(self,
-                       recurrent_net,
-                       batch_size,
-                       max_seqs=-1,
-                       seq_drop=0.0,
-                       max_seq_length=sys.maxsize,
-                       shuffle_batches=False,
-                       used_data_keys=None):
+  def generate_batches(self, shuffle_batches=False, **kwargs):
     """
-    :type recurrent_net: bool
-    :type batch_size: int
-    :type max_seqs: int
-    :type shuffle_batches: bool
-    :param set(str)|None used_data_keys:
+    :param bool shuffle_batches:
+    :param kwargs: will be passed to :func:`_generate_batches`
     :rtype: BatchSetGenerator
     """
     return BatchSetGenerator(
       dataset=self,
-      generator=self._generate_batches(
-        recurrent_net=recurrent_net,
-        batch_size=batch_size,
-        max_seqs=max_seqs,
-        seq_drop=seq_drop,
-        max_seq_length=max_seq_length,
-        used_data_keys=used_data_keys),
+      generator=self._generate_batches(**kwargs),
       shuffle_batches=shuffle_batches,
       cache_whole_epoch=self.batch_set_generator_cache_whole_epoch())
 
   @classmethod
   def index_shape_for_batches(cls, batches, data_key="data"):
-    shape = [0, 0]  # time,batch
+    """
+    :param list[EngineBatch.Batch] batches:
+    :param str data_key:
+    :return: shape as (time, batch)
+    :rtype: (int, int)
+    """
+    shape = [0, 0]  # time, batch
     for batch in batches:
       shape = [max(shape[0], batch.max_num_frames_per_slice[data_key]), shape[1] + batch.num_slices]
-    return shape
+    return tuple(shape)
 
 
 class DatasetSeq:
-  def __init__(self, seq_idx, features, targets, ctc_targets=None, seq_tag=None):
+  """
+  Encapsulates all data for one sequence.
+  """
+
+  def __init__(self, seq_idx, features, targets=None, ctc_targets=None, seq_tag=None):
     """
     :param int seq_idx: sorted seq idx in the Dataset
-    :param numpy.ndarray features: format 2d (time,feature) (float)
-    :param dict[str,numpy.ndarray] | numpy.ndarray | None targets: name -> format 1d (time) (idx of output-feature)
-    :param numpy.ndarray | None ctc_targets: format 1d (time) (idx of output-feature)
+    :param numpy.ndarray|dict[str,numpy.ndarray] features: format 2d (time,feature) (float)
+    :param dict[str,numpy.ndarray]|numpy.ndarray|None targets: name -> format 1d (time) (idx of output-feature)
+    :param numpy.ndarray|None ctc_targets: format 1d (time) (idx of output-feature)
     :param str seq_tag: sequence name / tag
     """
     assert isinstance(seq_idx, int)
-    assert isinstance(features, numpy.ndarray)
-    if targets is None:
-      targets = {}
-    if isinstance(targets, numpy.ndarray):  # old format
-      targets = {"classes": targets}
-    assert isinstance(targets, dict)
-    for target_values in targets.values():
-      assert isinstance(target_values, numpy.ndarray)
     self.seq_idx = seq_idx
     self.seq_tag = seq_tag or ("seq-%i" % seq_idx)
+    if not isinstance(features, dict):
+      assert isinstance(features, numpy.ndarray)
+      features = {"data": features}
+      if targets is None:
+        targets = {}
+      if isinstance(targets, numpy.ndarray):  # old format
+        targets = {"classes": targets}
+      assert isinstance(targets, dict)
+      features.update(targets)
+      targets = None
+    assert isinstance(features, dict) and targets is None
+    for v in features.values():
+      assert isinstance(v, numpy.ndarray)
     self.features = features
-    self.targets = targets
     self.ctc_targets = ctc_targets
 
   @property
@@ -728,27 +1033,38 @@ class DatasetSeq:
     """
     :rtype: NumbersDict
     """
-    d = {"data": self.features.shape[0]}
-    d.update({k: self.targets[k].shape[0] for k in self.targets.keys()})
+    d = {k: (v.shape[0] if v.ndim >= 1 else 1)
+         for (k, v) in self.features.items()}
     return NumbersDict(d)
 
   def get_data(self, key):
-    if key == "data":
-      return self.features
-    return self.targets[key]
+    """
+    :param str key:
+    :rtype: numpy.ndarray
+    """
+    return self.features[key]
 
   def get_data_keys(self):
-    return ["data"] + self.targets.keys()
+    """
+    :rtype: set[str]
+    """
+    return self.features.keys()
 
   def __repr__(self):
     return "<DataCache seq_idx=%i>" % self.seq_idx
 
 
 def get_dataset_class(name):
+  """
+  :param str name:
+  :rtype: type[Dataset]
+  """
   from importlib import import_module
   # Only those modules which make sense to be loaded by the user,
   # because this function is only used for such cases.
-  mod_names = ["HDFDataset", "SprintDataset", "GeneratingDataset", "NumpyDumpDataset", "MetaDataset", "LmDataset", "StereoDataset", "RawWavDataset"]
+  mod_names = [
+    "HDFDataset", "SprintDataset", "GeneratingDataset", "NumpyDumpDataset",
+    "MetaDataset", "LmDataset", "StereoDataset", "RawWavDataset"]
   for mod_name in mod_names:
     mod = import_module(mod_name)
     if name in vars(mod):
@@ -758,35 +1074,41 @@ def get_dataset_class(name):
   return None
 
 
-def init_dataset(kwargs):
+def init_dataset(kwargs, extra_kwargs=None, default_kwargs=None):
   """
   :param dict[str]|str|(()->dict[str]) kwargs:
+  :param dict[str]|None extra_kwargs:
+  :param dict[str]|None default_kwargs:
   :rtype: Dataset
   """
   assert kwargs
   if callable(kwargs):
-    return init_dataset(kwargs())
+    return init_dataset(kwargs(), extra_kwargs=extra_kwargs, default_kwargs=default_kwargs)
   if isinstance(kwargs, (str, unicode)):
-    if kwargs.startswith("config:"):
-      from Config import get_global_config
-      config = get_global_config()
-      assert config
-      return init_dataset(config.opt_typed_value(kwargs[len("config:"):]))
-    return init_dataset_via_str(config_str=kwargs)
+    if kwargs.startswith("{"):
+      kwargs = eval(kwargs)
+    else:
+      config_str = kwargs
+      kwargs = {}
+      if default_kwargs:
+        kwargs.update(default_kwargs)
+      if extra_kwargs:
+        kwargs.update(extra_kwargs)
+      return init_dataset_via_str(config_str=config_str, **kwargs)
+  assert isinstance(kwargs, dict)
   kwargs = kwargs.copy()
   assert "class" in kwargs
   clazz_name = kwargs.pop("class")
   clazz = get_dataset_class(clazz_name)
   if not clazz:
     raise Exception("Dataset class %r not found" % clazz_name)
-  files = kwargs.pop("files", [])
+  if default_kwargs:
+    for key, value in default_kwargs.items():
+      kwargs.setdefault(key, value)
+  if extra_kwargs:
+    kwargs.update(extra_kwargs)
   obj = clazz(**kwargs)
   assert isinstance(obj, Dataset)
-  if files:
-    from HDFDataset import HDFDataset, NextGenHDFDataset
-    assert isinstance(obj, (HDFDataset, NextGenHDFDataset))
-    for f in files:
-      obj.add_file(f)
   obj.initialize()
   return obj
 
@@ -805,11 +1127,17 @@ def init_dataset_via_str(config_str, config=None, cache_byte_size=None, **kwargs
   if config_str.startswith("sprint:"):
     kwargs["sprintConfigStr"] = config_str[len("sprint:"):]
     assert config, "need config for dataset in 'sprint:...' format. or use 'ExternSprintDataset:...' instead"
-    sprintTrainerExecPath = config.value("sprint_trainer_exec_path", None)
-    assert sprintTrainerExecPath, "specify sprint_trainer_exec_path in config"
-    kwargs["sprintTrainerExecPath"] = sprintTrainerExecPath
+    sprint_trainer_exec_path = config.value("sprint_trainer_exec_path", None)
+    assert sprint_trainer_exec_path, "specify sprint_trainer_exec_path in config"
+    kwargs["sprintTrainerExecPath"] = sprint_trainer_exec_path
     from SprintDataset import ExternSprintDataset
     cls = ExternSprintDataset
+  elif config_str.startswith("config:"):
+    from Config import get_global_config
+    if not config:
+      config = get_global_config()
+    data = eval(config_str[len("config:"):], config.typed_dict, config.typed_dict)
+    return init_dataset(data, extra_kwargs=kwargs)
   elif ":" in config_str:
     kwargs.update(eval("dict(%s)" % config_str[config_str.find(":") + 1:]))
     class_name = config_str[:config_str.find(":")]
@@ -836,7 +1164,9 @@ def convert_data_dims(data_dims, leave_dict_as_is=False):
   This converts what we called num_outputs originally,
   from the various formats which were allowed in the past
   (just an int, or dict[str,int]) into the format which we currently expect.
-  :param int | dict[str,int|(int,int)|dict] data_dims: what we called num_outputs originally
+  In all cases, the output will be a new copy of the dict.
+
+  :param int|dict[str,int|(int,int)|dict] data_dims: what we called num_outputs originally
   :param bool leave_dict_as_is:
   :rtype: dict[str,(int,int)|dict]
   :returns dict data-key -> (data-dimension, len(shape) (1 ==> sparse))
@@ -845,30 +1175,33 @@ def convert_data_dims(data_dims, leave_dict_as_is=False):
   if isinstance(data_dims, int):
     data_dims = {"classes": data_dims}
   assert isinstance(data_dims, dict)
+  data_dims = data_dims.copy()
   for k, v in list(data_dims.items()):
     if isinstance(v, int):
-      v = [v, 2 if k == "data" else 1]
+      v = (v, 2 if k == "data" else 1)
       data_dims[k] = v
     if isinstance(v, dict) and leave_dict_as_is:
       continue
     assert isinstance(v, (tuple, list))
+    data_dims[k] = tuple(v)
     assert len(v) == 2
     assert isinstance(v[0], int)
     assert isinstance(v[1], int)
-    assert 1 <= v[1] <= 2
+    assert 1 <= v[1]
   return data_dims
 
 
-def shapes_for_batches(batches, data_keys, dataset=None, extern_data=None):
+def shapes_for_batches(batches, data_keys, dataset=None, extern_data=None, enforce_min_len1=False):
   """
   :param list[EngineBatch.Batch] batches:
   :param list[str] data_keys:
   :param Dataset dataset:
   :param TFNetwork.ExternData extern_data: detailed data description. only used for TensorFlow
+  :param bool enforce_min_len1:
   :rtype: dict[str,list[int]] | None
   """
   assert dataset or extern_data
-  all_data_keys = set(data_keys) | {"data"}
+  all_data_keys = set(data_keys)
 
   # The final device.data.shape is in format (time,batch,feature) in case of Theano.
   shape = [NumbersDict(0), 0]  # time,batch
@@ -881,7 +1214,7 @@ def shapes_for_batches(batches, data_keys, dataset=None, extern_data=None):
   # We will just use one dummy frame in that case.
   # The index will stay zero in that case. (see EngineUtil.assign_dev_data())
   # However, also see the OutputLayer.output_index() behavior for forwarding.
-  if not extern_data:  # not needed if TensorFlow is used
+  if not extern_data or enforce_min_len1:  # not needed if TensorFlow is used
     for k in all_data_keys:
       shape[0][k] = max(shape[0][k], 1)
 
@@ -892,10 +1225,28 @@ def shapes_for_batches(batches, data_keys, dataset=None, extern_data=None):
       data_shape[extern_data.data[k].batch_dim_axis] = shape[1]
       if extern_data.data[k].have_time_axis():
         data_shape[extern_data.data[k].time_dim_axis] = shape[0][k]
-      assert all([n is not None for n in data_shape])
+      assert all([n is not None for n in data_shape]), "data %r" % extern_data.data[k]
       d[k] = data_shape
   else:  # shape via dataset
     d = {k: [shape[0][k], shape[1]] for k in all_data_keys}
     for k in all_data_keys:
       d[k] += dataset.get_data_shape(k)
   return d
+
+
+def set_config_num_inputs_outputs_from_dataset(config, dataset):
+  """
+  :param Config.Config config:
+  :param Dataset dataset:
+  """
+  from Util import BackendEngine
+  if BackendEngine.is_tensorflow_selected():
+    # TF supports more fine-grained specification,
+    # however the dataset does not store that in num_outputs.
+    from TFNetwork import ExternData
+    config.set("extern_data", {
+      key: ExternData.data_kwargs_from_dataset_key(dataset=dataset, key=key)
+      for key in dataset.get_data_keys()})
+  else:
+    config.set("num_inputs", dataset.num_inputs)
+    config.set("num_outputs", dataset.num_outputs)

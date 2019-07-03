@@ -1,21 +1,23 @@
-
 from __future__ import print_function
 
-import numpy
+import collections
+from math import ceil
 import sys
 import threading
 import time
+
+import numpy
 import theano
+
+from Device import Device
 from EngineUtil import assign_dev_data
 from Log import log
-from Util import hms, progress_bar, terminal_size, hdf5_strings, interrupt_main, NumbersDict
-from Device import Device
 from TaskSystem import ProcConnectionDied
-from math import ceil
+from Util import hms, progress_bar, terminal_size, hdf5_strings, interrupt_main, NumbersDict
 
 
 class TaskThread(threading.Thread):
-    def __init__(self, task, network, devices, data, batches, eval_batch_size=0, start_batch=0, share_batches = False, report_prefix=None, exclude=None, epoch=None):
+    def __init__(self, task, network, devices, data, batches, eval_batch_size=0, start_batch=0, share_batches = False, reduction_rate=1.0, report_prefix=None, exclude=None, epoch=None):
       """
       :type task: str
       :type network: Network.LayerNetwork
@@ -33,6 +35,7 @@ class TaskThread(threading.Thread):
       self.eval_batch_size = eval_batch_size
       self.eval_batch_idx = 0
       self.start_batch = start_batch
+      self.reduction_rate = reduction_rate
       self.devices = devices
       self.network = network
       self.batches = batches
@@ -119,6 +122,10 @@ class TaskThread(threading.Thread):
       # See Device.initialize().
       # We might also get gparams or ctc_priors or so. We will filter them out below when not needed.
       results = [Device.make_result_dict(res, result_format) for res in results]
+      if 'weights' in results[0]:
+        for batch, result in zip(batchess, results):
+          self.batches.dataset.update_weights(batch[0].seqs, result['weights'])
+          del result['weights']
 
       batch_norm_fact = 1 if not self.share_batches else 1.0 / len(self.devices)
       summed_results = {}
@@ -141,11 +148,6 @@ class TaskThread(threading.Thread):
         target = self._get_target_for_key(key)
         eval_info[key] = value / float(num_frames[target])
 
-      #if numpy.isinf(score) or numpy.isnan(score):
-      #  for i, res in enumerate(results):
-      #    if numpy.isinf(res["cost"]) or numpy.isnan(res["cost"]):
-      #      raise ModelBrokenError("Model is broken, got %s score." % score, batchess[i])
-      #  assert False  # Should not get here.
       return eval_info
 
     def initialize(self):
@@ -218,9 +220,9 @@ class TaskThread(threading.Thread):
 
       def allocate(self):
         self.devices_batches_idx = self.parent.batches.get_current_batch_idx()
-        self.devices_batches = self.parent.allocate_devices(self.alloc_devices)
+        self.allocated_devices_batches = self.parent.allocate_devices(self.alloc_devices)
         self.run_frames = NumbersDict(0)
-        for batches, device in zip(self.devices_batches,self.alloc_devices):
+        for batches, device in zip(self.allocated_devices_batches, self.alloc_devices):
           assert batches
           assert batches[0].seqs
           #assert batches[0].seqs[0].frame_length[1] > 0
@@ -242,7 +244,7 @@ class TaskThread(threading.Thread):
           self.parent.device_crash_batch = self.run_start_batch_idx
           self.crashed = True
           return False
-        assert len(device_results) == len(self.alloc_devices) == len(self.devices_batches)
+        assert len(device_results) == len(self.alloc_devices) == len(self.running_devices_batches)
 
         if outputs_format and any([k.startswith("gparam:") for k in outputs_format]):
           # WARNING: this code is untested and likely broken!
@@ -266,7 +268,10 @@ class TaskThread(threading.Thread):
             self.parent.updater.update()
             self.alloc_devices[i].set_net_params(self.parent.network)
 
-        self.result = { 'batchess': self.devices_batches, 'results': device_results, 'result_format': outputs_format, 'num_frames': self.num_frames }
+        self.result = { 'batchess': self.running_devices_batches,
+                        'results': device_results,
+                        'result_format': outputs_format,
+                        'num_frames': self.num_frames }
         self.eval_info = self.parent.evaluate(**self.result)
         self.parent.lock.acquire()
         self.print_process()
@@ -297,8 +302,9 @@ class TaskThread(threading.Thread):
 
       def device_run(self):
         batch_idx = self.run_start_batch_idx = self.devices_batches_idx
-        assert len(self.alloc_devices) == len(self.devices_batches)
-        for device, batches in zip(self.alloc_devices, self.devices_batches):
+        assert len(self.alloc_devices) == len(self.allocated_devices_batches)
+        self.running_devices_batches = self.allocated_devices_batches
+        for device, batches in zip(self.alloc_devices, self.running_devices_batches):
           if self.parent.network.recurrent:
             print("running", device.targets["data"].shape[1], \
                              "sequence slices (%i nts)" % (device.targets["data"].shape[0] * device.targets["data"].shape[1]), end=' ', file=log.v5)
@@ -416,6 +422,7 @@ class TaskThread(threading.Thread):
 
       results = { 'batchess': [], 'results': [], 'num_frames' : NumbersDict(0) }
       run_frames = NumbersDict(0)
+      cost_result_format = -1
 
       crashed = False
       assert num_device_runs > 0
@@ -440,7 +447,14 @@ class TaskThread(threading.Thread):
         if crashed:
           break
 
-        if run_frames.max_value() >= self.eval_batch_size or not self.batches.has_more():
+        if cost_result_format < 0 and deviceRuns[i].result['result_format']:
+          for idx,fmt in enumerate(deviceRuns[i].result['result_format']):
+            if fmt and fmt.startswith('cost:'):
+              cost_result_format = idx
+        total_cost = 0
+        if results['results'] and cost_result_format >= 0:
+          total_cost = numpy.asarray(results['results'])[:,cost_result_format].sum()
+        if total_cost >= self.eval_batch_size or not self.batches.has_more():
           if all(not (dev.finished or dev.allocated or dev.processing) for dev in deviceRuns):
             results['num_frames'] = run_frames
             self.num_frames += run_frames
@@ -458,8 +472,9 @@ class TaskThread(threading.Thread):
           else:
             time.sleep(0.01)
 
+
         match = True
-        while self.batches.has_more() and run_frames.max_value() < self.eval_batch_size and match:
+        while self.batches.has_more() and total_cost < self.eval_batch_size and match:
           self.batch_idx = self.batches.get_current_batch_idx()
           if self.batch_idx < self.start_batch:
             self.batches.advance(1)
@@ -548,6 +563,7 @@ class TrainTaskThread(TaskThread):
 
   def save_ctc_priors(self, filename, epoch_str):
     assert self.ctc_priors is not None
+    return # this should be done using compute_priors
     with open(filename, 'a') as f:
       print(epoch_str, file=f)
       numpy.savetxt(f, self.ctc_priors, newline=" ")
@@ -596,6 +612,38 @@ class TrainTaskThread(TaskThread):
   def reduce(self, num_frames):
     for device in self.devices:
       device.sync_net_train_params()
+    basenet = self.network.get_all_params_vars()
+    consnet = [numpy.zeros(p.get_value().shape, dtype='float32') for p in basenet]
+    hypnets = []
+    nparams = len(basenet)
+    encoded = []
+    for device in self.devices:
+      hypnets.append([ p for p in device.get_net_train_params(self.network) ])
+      assert len(hypnets[-1]) == len(basenet)
+    if len(hypnets) == 0:
+      consnet = basenet
+    elif len(hypnets) == 1:
+      consnet = hypnets[0]
+    else:
+      # consensus via average
+      for i in range(nparams):
+        num_updates = { dev.name : dev.get_total_cost() for net,dev in zip(hypnets,self.devices) if numpy.sum(abs(net[i] - basenet[i].get_value())) > numpy.float32(0) }
+        tot_updates = sum(num_updates.values()) / self.reduction_rate
+        if tot_updates:
+          consnet[i] = basenet[i].get_value() + numpy.sum([ (net[i] - basenet[i].get_value()) * float(num_updates[dev.name]) / tot_updates for net,dev in zip(hypnets,self.devices) if dev.name in num_updates ], axis = 0)
+        else:
+          print("warning: no update available for parameter", basenet[i], file=log.v3)
+          consnet[i] = basenet[i].get_value()
+    self.network.update_step = max([ dev.get_num_updates() for dev in self.devices ])
+    for p, q in zip(self.network.get_all_params_vars(), consnet):
+      p_shape = p.get_value(borrow=True, return_internal_type=True).shape
+      assert p_shape == q.shape
+      p.set_value(q)
+      encoded.append(q)
+    if len(hypnets) > 1:
+      for device in self.devices:
+        device.set_net_encoded_params(encoded)
+    return
     try:
       basenet = self.network.get_all_params_vars()
       consnet = [numpy.zeros(p.get_value().shape, dtype='float32') for p in basenet]
@@ -614,18 +662,18 @@ class TrainTaskThread(TaskThread):
       else:
         # consensus via average
         for i in range(nparams):
-          num_updates = { dev.name : dev.num_updates for net,dev in zip(hypnets,self.devices) if numpy.sum(abs(net[i] - basenet[i].get_value())) > numpy.float32(0) }
-          tot_updates = sum(num_updates.values())
+          num_updates = { dev.name : dev.get_total_cost() for net,dev in zip(hypnets,self.devices) if numpy.sum(abs(net[i] - basenet[i].get_value())) > numpy.float32(0) }
+          tot_updates = sum(num_updates.values()) / self.reduction_rate
           #num_updates = numpy.sum([ dev.num_updates for net,dev in zip(hypnets,self.devices) ])
           #ndevs = len([ dev for dev in self.devices if abs(numpy.sum(net[i] - basenet[i].get_value())) > 0.0001 ])
           #consnet[i] = basenet[i].get_value() + numpy.sum([(net[i] - basenet[i].get_value()) * (float(device.num_frames) / num_frames) for net,dev in zip(hypnets,self.devices) if basenet[i].layer.name in dev.update_specs['layers']], axis = 0)
           if tot_updates:
-            consnet[i] = basenet[i].get_value() + numpy.sum([ (net[i] - basenet[i].get_value()) * (float(num_updates[dev.name]) / tot_updates) for net,dev in zip(hypnets,self.devices) if dev.name in num_updates ], axis = 0)
+            consnet[i] = basenet[i].get_value() + numpy.sum([ (net[i] - basenet[i].get_value()) * grads[dev.name] * float(num_updates[dev.name]) / tot_updates for net,dev in zip(hypnets,self.devices) if dev.name in num_updates ], axis = 0)
           else:
             print("warning: no update available for parameter", basenet[i], file=log.v3)
             consnet[i] = basenet[i].get_value()
           #consnet[i] = basenet[i].get_value() + ndevs * numpy.sum([ (net[i] - basenet[i].get_value()) * (float(device.num_frames) / nframes) for net,dev in zip(hypnets,self.devices) ], axis = 0)
-      self.network.update_step = sum([ dev.get_num_updates() for dev in self.devices ]) / len(self.devices)
+      self.network.update_step = max([ dev.get_num_updates() for dev in self.devices ])
       for p, q in zip(self.network.get_all_params_vars(), consnet):
         p_shape = p.get_value(borrow=True, return_internal_type=True).shape
         assert p_shape == q.shape
@@ -657,6 +705,27 @@ class EvalTaskThread(TaskThread):
       super(EvalTaskThread, self).initialize()
       for device in self.devices:
         device.set_net_params(self.network)
+
+class ForwardTaskThread(TaskThread):
+    def __init__(self, network, devices, data, batches, eval_batch_size=0):
+      super(ForwardTaskThread, self).__init__('extract', network, devices, data, batches, eval_batch_size=eval_batch_size)
+      self.result = {}
+
+    def evaluate(self, batchess, results, result_format, num_frames):
+      fragments = collections.defaultdict(list)
+      for device_idx, batches in enumerate(batchess):
+        for batch_idx, batch in enumerate(batches):
+          for seq_idx, seq in enumerate(batch.seqs):
+            fragments[seq.seq_idx].append((seq.seq_start_frame['data'], seq, results[device_idx][batch_idx]))
+      for seq, parts in fragments.items():
+        prev_end_frame = -1
+        seq_idx = None
+        for part in sorted(parts):
+          assert part[0] == prev_end_frame + 1
+          prev_end_frame = part[1].seq_end_frame
+        self.result[seq] = numpy.concatenate([r[s.batch_frame_offset['data']:(s.seq_end_frame['data'] - s.seq_start_frame['data']),s.batch_slice,:]
+                                             for _, s, r in parts], axis=0)
+
 
 class HDFForwardTaskThread(TaskThread):
     def __init__(self, network, devices, data, batches, cache, compression="none"):
@@ -789,7 +858,7 @@ class PriorEstimationTaskThread(TaskThread):
         print("HINT: You can set extract=posteriors-sum in your config to speed up the estimation.", file=log.v1)
       if extract_type.startswith("log-"):
         print("NOTE: Posteriors are averaged in log-space. std-space might be better. Set extract=posteriors-sum.", file=log.v1)
-      if data.chunk_size > 0:
+      if data.chunk_size != 0:
         print("WARNING: Dataset uses chunking. You might want to disable that.", file=log.v1)
 
     def evaluate(self, batchess, results, result_format, num_frames):
@@ -822,4 +891,3 @@ class PriorEstimationTaskThread(TaskThread):
       numpy.savetxt(self.priori_file, average_posterior, delimiter=' ')
       avg_sum = numpy.sum(numpy.exp(average_posterior))
       print("Prior sum in std-space (should be close to 1.0):", avg_sum, file=log.v1)
-

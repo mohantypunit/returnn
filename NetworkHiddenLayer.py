@@ -217,7 +217,7 @@ class WindowLayer(_NoOpLayer):
 class WindowContextLayer(_NoOpLayer):
   layer_class = "window_context"
 
-  def __init__(self, window, average='uniform', scan=False, n_out=None, **kwargs):
+  def __init__(self, window, average='concat', direction = -1, scan=False, n_out=None, **kwargs):
     super(WindowContextLayer, self).__init__(**kwargs)
     source, n_in = concat_sources(self.sources, unsparse=False)
     if n_out is not None:
@@ -230,25 +230,28 @@ class WindowContextLayer(_NoOpLayer):
     self.set_attr('n_out', n_out)
     self.set_attr('window', window)
     self.set_attr('average', average)
+    self.set_attr('direction', direction)
 
     if average == 'exponential':
       weights = numpy.float32(1) / T.arange(1, window + 1,dtype='float32')[::-1]
     elif average == 'uniform':
       weights = numpy.float32(1) / (T.cast(window,'float32') * T.ones((window,),'float32'))
+    elif average == 'concat':
+      weights = None
+      self.set_attr('n_out', n_out * window)
     else:
       assert False, "invalid averaging method: " + str(average)
 
     if scan:
+      source = source[::-direction]
       inp = T.concatenate([T.zeros((window - 1, source.shape[1], source.shape[2]), 'float32'), source], axis=0)
       def wnd(x, i, inp, weights):
         return T.dot(inp[i:i + window].dimshuffle(1, 2, 0), weights), i
       mapped_out, _ = theano.map(wnd, sequences=[source, T.arange(source.shape[0])], non_sequences=[inp, weights])
-      self.make_output(mapped_out[0])
+      self.make_output(mapped_out[0][::-direction])
     else:
       from TheanoUtil import context_batched
-      tiled_out = context_batched(source, window=window)
-      windows = tiled_out.reshape((source.shape[0],source.shape[1],window,source.shape[2])).dimshuffle(0,1,3,2)
-      out = T.dot(windows, weights)
+      out = context_batched(source[::-direction], window=window)[::-direction]
       self.make_output(out)
 
 
@@ -259,17 +262,17 @@ class DownsampleLayer(_NoOpLayer):
   """
   layer_class = "downsample"
 
-  def __init__(self, factor, axis, method="average", padding=False, sample_target=False, base=None, **kwargs):
+  def __init__(self, factor, axis, method="average", padding=False, sample_target=False, fit_target=False, base=None, **kwargs):
     super(DownsampleLayer, self).__init__(**kwargs)
     self.set_attr("method", method)
-    if isinstance(axis, (str, unicode)):
+    if isinstance(axis, (str)):
       axis = json.loads(axis)
     if isinstance(axis, set): axis = tuple(axis)
     assert isinstance(axis, int) or isinstance(axis, (tuple, list)), "int or list[int] expected for axis"
     if isinstance(axis, int): axis = [axis]
     axis = list(sorted(axis))
     self.set_attr("axis", axis)
-    if isinstance(factor, (str, unicode)):
+    if isinstance(factor, (str)):
       factor = json.loads(factor)
     assert isinstance(factor, (int, float)) or isinstance(axis, (tuple, list)), "int|float or list[int|float] expected for factor"
     if isinstance(factor, (int, float)): factor = [factor] * len(axis)
@@ -288,11 +291,20 @@ class DownsampleLayer(_NoOpLayer):
         if padding:
           z = T.concatenate([z,T.zeros((f-T.mod(z.shape[a], f), z.shape[1], z.shape[2]), 'float32')],axis=0)
         z = TheanoUtil.downsample(z, axis=a, factor=f, method=method)
-        if sample_target:
+        if sample_target or fit_target:
           if self.y_out.dtype == 'float32':
-            self.y_out = TheanoUtil.downsample(self.y_out, axis=a, factor=f, method=method)
+            if padding:
+              self.y_out = T.concatenate(
+                [self.y_out, T.zeros((f - T.mod(self.y_out.shape[0], f), self.y_out.shape[1], self.y_out.shape[2]),
+                                     'float32')], axis=0)
+            if sample_target:
+              self.y_out = TheanoUtil.downsample(self.y_out, axis=0, factor=f, method=method)
           else:
-            self.y_out = TheanoUtil.downsample(self.y_out, axis=a, factor=f, method='max')
+            if padding:
+              self.y_out = T.concatenate(
+                [self.y_out, T.zeros((f - T.mod(self.y_out.shape[0], f), self.y_out.shape[1]), 'int32')], axis=0)
+            if sample_target:
+              self.y_out = TheanoUtil.downsample(self.y_out, axis=0, factor=f, method='max')
       else:
         z = TheanoUtil.downsample(z, axis=a, factor=f, method=method)
         if a < self.y_out.ndim:
@@ -300,11 +312,13 @@ class DownsampleLayer(_NoOpLayer):
       if a == 0:
         self.index = self.sources[0].index
         if padding:
-          self.index = T.concatenate([self.index, T.zeros((f-T.mod(self.index.shape[a], f), self.index.shape[1]), 'int8')], axis=0)
-        self.index = TheanoUtil.downsample(self.index, axis=0, factor=f, method="max")
+          self.index = T.concatenate([self.index, T.zeros((f-T.mod(self.index.shape[0], f), self.index.shape[1]), 'int8')], axis=0)
+          if fit_target:
+            self.index_out = self.index
+        self.index = TheanoUtil.downsample(self.index, axis=0, factor=f, method="min")
         if sample_target:
-          self.index_out = TheanoUtil.downsample(self.index_out, axis=0, factor=f, method="max")
-        else:
+          self.index_out = TheanoUtil.downsample(self.index_out, axis=0, factor=f, method="min")
+        elif not fit_target:
           self.index_out = self.index if base is None else base[0].index_out
       elif a == 2:
         n_out = int(n_out / f)
@@ -357,6 +371,11 @@ class DownsampleLayer(_NoOpLayer):
     self.set_attr('n_out', n_out)
     self.make_output(output)
 
+    if fit_target:
+      self.output = print_to_file('o.out', self.output, shape=True)
+      self.index_out = print_to_file('o.idx', self.index_out, shape=True)
+      self.y_out = print_to_file('o.y', self.y_out, shape=True)
+
 class UpsampleLayer(_NoOpLayer):
   layer_class = "upsample"
 
@@ -400,6 +419,21 @@ class UpsampleLayer(_NoOpLayer):
     self.make_output(z)
 
 
+class RepetitionLayer(_NoOpLayer):
+  layer_class = "rep"
+
+  def __init__(self, factor, **kwargs):
+    super(RepetitionLayer, self).__init__(**kwargs)
+    factor = numpy.int32(factor)
+    self.set_attr("factor", factor)
+    inp, n_out = _concat_sources(self.sources, masks=self.masks, mass=self.mass)
+    self.set_attr('n_out', n_out)
+    time, batch, dim = inp.shape[0], inp.shape[1], inp.shape[2]
+
+    self.index = self.index.dimshuffle(0,'x',1).repeat(factor,axis=1).reshape((time * factor, batch))
+    self.output = inp.dimshuffle(0,'x',1,2).repeat(factor,axis=1).reshape((time * factor,batch,dim))
+
+
 class FrameConcatZeroLayer(_NoOpLayer): # TODO: This is not correct for max_seqs > 1
   """
   Concats zero at the start (left=True) or end in the time-dimension.
@@ -440,16 +474,15 @@ class FrameCutoffLayer(_NoOpLayer): # TODO: This is not correct for max_seqs > 1
     super(FrameCutoffLayer, self).__init__(**kwargs)
     self.set_attr("num_frames", num_frames)
     self.set_attr("left", left)
-    assert len(self.sources) == 1
-    s = self.sources[0]
-    for attr in ["n_out", "sparse"]:
-      self.set_attr(attr, s.attrs[attr])
+    x_in, n_in = _concat_sources(self.sources, masks=self.masks, mass=self.mass)
+    i_in = self.sources[0].index
+    self.set_attr("n_out", n_in)
     if left:
-      self.output = s.output[num_frames:]
-      self.index = s.index[num_frames:]
+      self.output = x_in[num_frames:]
+      self.index = i_in[num_frames:]
     else:
-      self.output = s.output[:-num_frames]
-      self.index = s.index[:-num_frames]
+      self.output = x_in[:-num_frames]
+      self.index = i_in[:-num_frames]
 
 
 class ReverseLayer(_NoOpLayer):
@@ -540,11 +573,11 @@ class SubnetworkLayer(_NoOpLayer):
     """
     super(SubnetworkLayer, self).__init__(**kwargs)
     self.set_attr("n_out", n_out)
-    if isinstance(subnetwork, (str, unicode)):
+    if isinstance(subnetwork, str):
       subnetwork = json.loads(subnetwork)
     self.set_attr("subnetwork", subnetwork)
     self.set_attr("load", load)
-    if isinstance(data_map, (str, unicode)):
+    if isinstance(data_map, str):
       data_map = json.loads(data_map)
     if data_map:
       self.set_attr("data_map", data_map)
@@ -587,7 +620,7 @@ class SubnetworkLayer(_NoOpLayer):
       config = get_global_config()  # this is a bit hacky but works fine in all my cases...
       model_filename = load % {"self": self,
                                "global_config_load": config.value("load", None),
-                               "global_config_epoch": config.int("epoch", 0)}
+                               "global_config_epoch": config.value("epoch", 0)}
       print("loading subnetwork weights from", model_filename, file=log.v2)
       import h5py
       model_hdf = h5py.File(model_filename, "r")
@@ -630,11 +663,11 @@ class ClusterDependentSubnetworkLayer(_NoOpLayer):
     """
     super(ClusterDependentSubnetworkLayer, self).__init__(**kwargs)
     self.set_attr("n_out", n_out)
-    if isinstance(subnetwork, (str, unicode)):
+    if isinstance(subnetwork, str):
       subnetwork = json.loads(subnetwork)
     self.set_attr("subnetwork", subnetwork)
     self.set_attr("load", load)
-    if isinstance(data_map, (str, unicode)):
+    if isinstance(data_map, str):
       data_map = json.loads(data_map)
     if data_map:
       self.set_attr("data_map", data_map)
@@ -804,7 +837,7 @@ class ChunkingSublayer(_NoOpLayer):
     self.set_attr('n_out', n_out)
     self.set_attr('chunk_size', chunk_size)
     self.set_attr('chunk_step', chunk_step)
-    if isinstance(sublayer, (str, unicode)):
+    if isinstance(sublayer, str):
       sublayer = json.loads(sublayer)
     self.set_attr('sublayer', sublayer.copy())
     self.set_attr('chunk_distribution', chunk_distribution)
@@ -1780,6 +1813,18 @@ class ChunkingLayer(ForwardLayer): # Time axis reduction like in pLSTM described
     self.make_output(output)
 
 
+class DimToTimeLayer(ForwardLayer):
+  layer_class = "dim_to_time"
+
+  def __init__(self, n_time, **kwargs):
+    kwargs['n_out'] = sum([s.attrs['n_out'] for s in kwargs['sources']]) // n_time
+    super(DimToTimeLayer, self).__init__(**kwargs)
+    self.params = {}
+    x = T.concatenate([s.output for s in self.sources], axis=2) # TBD
+    z = x.reshape((x.shape[0], x.shape[1], n_time, x.shape[2]//n_time))
+    self.output = z.dimshuffle(0,2,1,3).reshape((x.shape[0] * n_time, x.shape[1], x.shape[2]//n_time))
+    self.index = self.index.dimshuffle(0,'x',1).repeat(n_time,axis=1).reshape((self.index.shape[0] * n_time, self.index.shape[1]))
+
 class TimeToBatchLayer(ForwardLayer):
   layer_class = "time_to_batch"
 
@@ -1803,9 +1848,10 @@ class BatchToTimeLayer(ForwardLayer):
     self.params = {}
     z = T.concatenate([s.output for s in self.sources], axis=2) # TBD
     z = z.reshape((z.shape[0] * z.shape[1],z.shape[2]))
-    self.output = z.reshape((z.shape[0]/n_batch,n_batch,z.shape[1]))
+    self.output = z.reshape((z.shape[0]//n_batch,n_batch,z.shape[1]))
     self.index = self.index.reshape((self.index.shape[0] * self.index.shape[1],))
-    self.index = self.index.reshape((self.index.shape[0]/n_batch,n_batch))
+    self.index = self.index.reshape((self.index.shape[0]//n_batch,n_batch))
+
 
 class ConcatBatchLayer(_NoOpLayer):
   layer_class = "concat_batch"
@@ -2898,7 +2944,8 @@ class AlignmentLayer(ForwardLayer):
 class CAlignmentLayer(ForwardLayer):
   layer_class = "calign"
 
-  def __init__(self, direction='inv', tdps=None, nstates=1, nstep=1, min_skip=1, max_skip=30, search='align', train_skips=False, train_emission=False, clip_emission=1.0,
+  def __init__(self, direction='inv', tdps=None, nstates=1, nstep=1, min_skip=1, max_skip=30, search='align', train_skips=False, train_emission=False, clip_emission=1.0, train_attention=False,
+               compute_priors=False,
                base=None, coverage=0, output_z=False, reduce_output=True, blank=None, nil = None, focus='last', mode='viterbi', **kwargs):
     assert direction == 'inv'
     target = kwargs['target'] if 'target' in kwargs else 'classes'
@@ -2976,6 +3023,11 @@ class CAlignmentLayer(ForwardLayer):
       q_in = T.dot(x_in, W_skip) + b_skip
       q_in = T.nnet.softmax(q_in.reshape((q_in.shape[0] * q_in.shape[1], q_in.shape[2]))).reshape(q_in.shape)
 
+    if train_attention:
+      W_att = self.add_param(self.create_forward_weights(n_out, 1, name="W_att_%s" % self.name))
+      b_att = self.add_param(self.create_bias(1, name='b_att_%s' % self.name))
+      q_in = T.dot(x_in, W_att) + b_att
+      q_in = T.nnet.sigmoid(q_in)
 
     if reduce_output:
       self.output = z_out if output_z else x_out
@@ -3021,12 +3073,14 @@ class CAlignmentLayer(ForwardLayer):
     if train_skips:
       y_out = T.dot(self.attention, T.arange(x_in.shape[0],dtype='float32')) # NB
       y_out = T.concatenate([T.zeros_like(y_out[:1]), y_out],axis=0) # (N+1)B
-      y_out = T.cast(T.round(y_out[1:] - y_out[:-1]) * T.cast(self.index,'float32'),'int32') # NB
+      y_out = T.cast(T.round(y_out[1:] - y_out[:-1]) * T.cast(rindex,'float32'),'int32') # NB
+      #y_out = print_to_file('out',y_out)
 
       W_skip = self.add_param(self.create_forward_weights(n_out, max_skip, name="W_skip_%s" % self.name))
       b_skip = self.add_param(self.create_bias(max_skip, name='b_skip_%s' % self.name))
       z_out = T.dot(x_out, W_skip) + b_skip
       self.q_in = T.nnet.softmax(self.z.reshape((self.z.shape[0] * self.z.shape[1], self.z.shape[2]))).reshape(self.z.shape)
+
     elif train_emission:
       idx = (self.sources[0].index.flatten() > 0).nonzero()
       norm = T.sum(self.network.j[target],dtype='float32') / T.sum(self.sources[0].index,dtype='float32')
@@ -3043,6 +3097,15 @@ class CAlignmentLayer(ForwardLayer):
       z_out = q_in.reshape((q_in.shape[0] * q_in.shape[1], q_in.shape[2])) # (TB)2
       self.cost_val = norm * -T.sum(y_out[idx] * T.log(z_out[idx]))
       self.error_val = norm * T.sum(T.ge(T.sqr(z_out[idx,1]-y_out[idx,1]),numpy.float32(1./self.n_cls)))
+      self.p_y_given_x = q_in[:,:,1:]
+      self.attrs['n_cls'] = 1
+      return
+    elif train_attention:
+      idx = (self.sources[0].index.flatten() > 0).nonzero()
+      y_out = T.round(T.sum(self.attention,axis=0).dimshuffle(1,0)).cast('int32') # TB
+      y_out = (y_out.flatten() > 0).nonzero()
+      self.cost_val = -T.log(q_in.flatten()[y_out[idx]]).sum()
+      self.error_val = T.sum(T.neq(T.round(q_in).flatten().cast('int32')[idx], y_out[idx]))
       return
     else:
       y_out = self.y_out
@@ -3052,6 +3115,15 @@ class CAlignmentLayer(ForwardLayer):
     nll, _ = T.nnet.crossentropy_softmax_1hot(x=z_out[idx], y_idx=y_out[idx])
     self.cost_val = norm * T.sum(nll)
     self.error_val = norm * T.sum(T.neq(T.argmax(z_out[idx], axis=1), y_out[idx]))
+
+    if compute_priors:
+      self.set_attr('compute_priors', compute_priors)
+      custom = T.mean(theano.tensor.extra_ops.to_one_hot(y_out[idx], self.n_cls, 'float32'), axis=0)
+      custom_init = numpy.ones((self.n_cls,), 'float32') / numpy.float32(self.n_cls)
+      self.priors = self.add_param(theano.shared(custom_init, 'priors'), 'priors',
+                                   custom_update=custom,
+                                   custom_update_normalized=True,
+                                   custom_update_exp_average=False)
 
   def cost(self):
     return self.cost_val * self.cost_scale_val, None
@@ -3946,7 +4018,7 @@ class SegmentInputLayer(_NoOpLayer):
     def perform(self, node, inputs, output_storage):
       output_storage[0][0] = inputs[0].view(dtype='float32')
 
-  def __init__(self, window=15, **kwargs):
+  def __init__(self, window=15, input_is_sparse=False, num_classes=None, **kwargs):
     super(SegmentInputLayer, self).__init__(**kwargs)
 
     assert len(self.sources) == 1
@@ -3960,7 +4032,10 @@ class SegmentInputLayer(_NoOpLayer):
     b = src_out.shape[1]  # number of batches
     d = src_out.shape[2]  # feature dimension
 
-    rs = src_out.dimshuffle(1, 0, 2).reshape((f * b, d))
+    if input_is_sparse:
+      rs = src_out.dimshuffle(1, 0).reshape((f * b,))
+    else:
+      rs = src_out.dimshuffle(1, 0, 2).reshape((f * b, d))
     rs_idx = src_index.dimshuffle(1, 0).flatten()
 
     frames_idx = T.arange(f * b)[(rs_idx>0).nonzero()]\
@@ -3981,7 +4056,10 @@ class SegmentInputLayer(_NoOpLayer):
     frames_idx = T.switch(frame_filter_1 * frame_filter_2 > 0, frames_idx, -1).dimshuffle(1, 0)
 
     # we add an additional vector with zeros s.t. the invalid entries from the filters above result in a feature vector of zeros
-    self.z = T.concatenate([rs, T.zeros((1, src_out.shape[2]))], axis=0)[frames_idx]
+    zero = T.zeros((1,), dtype='int8') if input_is_sparse else T.zeros((1, src_out.shape[2]))
+    self.z = T.concatenate([rs, zero], axis=0)[frames_idx]
+    if input_is_sparse:
+      self.z = T.extra_ops.to_one_hot(self.z.flatten(), num_classes).reshape((self.z.shape[0], self.z.shape[1], num_classes))
     self.make_output(self.z)
 
     self.index = T.cast((frame_filter_1 * frame_filter_2).clip(0, 1), 'int8').T
@@ -4087,4 +4165,3 @@ class SegmentClassTargets(_NoOpLayer):
                                                                   T.TensorConstant(theano.tensor.iscalar, self.attrs['window']),
                                                                   self.sources[0].output, self.sources[0].index)
     self.output = self.y_out
-

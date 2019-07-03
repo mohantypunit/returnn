@@ -70,7 +70,7 @@ def main(argv):
     dataset = eval(args.get("crnn-dataset"), {}, ObjAsDict(GeneratingDataset))
     assert isinstance(dataset, Dataset)
     assert dataset.num_inputs == inputDim
-    assert dataset.num_outputs == {"classes": [outputDim, 1], "data": [inputDim, 2]}
+    assert dataset.num_outputs == {"classes": (outputDim, 1), "data": (inputDim, 2)}
     dataset.init_seq_order(epoch=1)
 
     seq_idx = 0
@@ -84,9 +84,11 @@ def main(argv):
           kwargs["orthography"] = dataset.get_targets("orth", seq_idx)
         if "classes" in dataset.get_target_list():
           kwargs["alignment"] = dataset.get_targets("classes", seq_idx)
+        print("DummySprintExec seq_idx %i feedInputAndTarget(**%r)" % (seq_idx, kwargs))
         SprintAPI.feedInputAndTarget(**kwargs)
       else:
         raise NotImplementedError("targetMode = %s" % targetMode)
+      seq_idx += 1
 
   print("DummySprintExec exit")
   SprintAPI.exit()

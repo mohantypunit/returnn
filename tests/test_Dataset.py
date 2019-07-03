@@ -6,10 +6,12 @@ from __future__ import print_function
 import sys
 sys.path += ["."]  # Python 3 hack
 
+import unittest
 from nose.tools import assert_equal, assert_is_instance, assert_in, assert_not_in, assert_true, assert_false
-from GeneratingDataset import GeneratingDataset, DummyDataset
+from GeneratingDataset import GeneratingDataset, DummyDataset, DummyDatasetMultipleSequenceLength
 from EngineBatch import Batch
 from Dataset import DatasetSeq
+from Util import NumbersDict
 import numpy as np
 
 import better_exchook
@@ -59,6 +61,23 @@ def test_iterate_seqs_chunking_1():
   assert_equal(seqs[3], (1, 0, 10))
   assert_equal(seqs[4], (1, 5, 11))
   assert_equal(seqs[5], (1, 10, 11))
+
+
+def test_iterate_seqs_chunking_varying_sequence_length():
+  dataset = DummyDatasetMultipleSequenceLength(input_dim=2, output_dim=3, num_seqs=2, seq_len={'data': 24, 'classes': 12})
+  dataset.init_seq_order(1)
+  seqs = list(dataset.iterate_seqs(chunk_size={'data': 12, 'classes': 6}, chunk_step={'data': 6, 'classes': 3}, used_data_keys=None))
+  for s in seqs:
+    print(s)
+  assert_equal(len(seqs), 8)
+  assert_equal(seqs[0], (0, NumbersDict({'data':0, 'classes': 0}), NumbersDict({'data':12, 'classes': 6})))
+  assert_equal(seqs[1], (0, NumbersDict({'data':6, 'classes': 3}), NumbersDict({'data':18, 'classes': 9})))
+  assert_equal(seqs[2], (0, NumbersDict({'data':12, 'classes': 6}), NumbersDict({'data':24, 'classes': 12})))
+  assert_equal(seqs[3], (0, NumbersDict({'data':18, 'classes': 9}), NumbersDict({'data':24, 'classes': 12})))
+  assert_equal(seqs[4], (1, NumbersDict({'data':0, 'classes': 0}), NumbersDict({'data':12, 'classes': 6})))
+  assert_equal(seqs[5], (1, NumbersDict({'data':6, 'classes': 3}), NumbersDict({'data':18, 'classes': 9})))
+  assert_equal(seqs[6], (1, NumbersDict({'data':12, 'classes': 6}), NumbersDict({'data':24, 'classes': 12})))
+  assert_equal(seqs[7], (1, NumbersDict({'data':18, 'classes': 9}), NumbersDict({'data':24, 'classes': 12})))
 
 
 def test_batches_recurrent_1():
@@ -128,7 +147,7 @@ def test_batches_non_recurrent_1():
   dataset = DummyDataset(input_dim=2, output_dim=3, num_seqs=2, seq_len=11)
   dataset.init_seq_order(1)
   batch_gen = dataset.generate_batches(recurrent_net=False, max_seqs=2, batch_size=5)
-  all_batches = []; " :type: list[Batch] "
+  all_batches = []  # type: list[Batch]
   while batch_gen.has_more():
     batch, = batch_gen.peek_next_n(1)
     assert_is_instance(batch, Batch)
@@ -305,3 +324,26 @@ def test_task12ax_window():
   assert_equal(list(data2a[1, 1]), list(data1[1]))
   assert_equal(list(data2a[1, 2]), list(data1[2]))
   assert_equal(list(data2a[-1, 2]), [0] * input_dim)  # zero-padded right
+
+
+if __name__ == "__main__":
+  better_exchook.install()
+  if len(sys.argv) <= 1:
+    for k, v in sorted(globals().items()):
+      if k.startswith("test_"):
+        print("-" * 40)
+        print("Executing: %s" % k)
+        try:
+          v()
+        except unittest.SkipTest as exc:
+          print("SkipTest:", exc)
+        print("-" * 40)
+    print("Finished all tests.")
+  else:
+    assert len(sys.argv) >= 2
+    for arg in sys.argv[1:]:
+      print("Executing: %s" % arg)
+      if arg in globals():
+        globals()[arg]()  # assume function and execute
+      else:
+        eval(arg)  # assume Python code and execute
